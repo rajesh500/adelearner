@@ -1,0 +1,9 @@
+{
+	"name": "adfadeleanersproject100",
+	"location": "eastus",
+	"identity": {
+		"type": "SystemAssigned",
+		"principalId": "d614e2c6-4c3c-46c2-92a5-4c08a6952e8c",
+		"tenantId": "3879c4db-467d-44c4-bfe5-cc69308f0c1f"
+	}
+}
