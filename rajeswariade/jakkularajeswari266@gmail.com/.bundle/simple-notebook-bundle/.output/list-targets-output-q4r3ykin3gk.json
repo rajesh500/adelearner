@@ -1,0 +1,14 @@
+{
+  "targets": [
+    {
+      "name": "dev",
+      "mode": "development",
+      "host": "https://adb-7405605275277665.5.azuredatabricks.net"
+    },
+    {
+      "name": "qa",
+      "mode": "production",
+      "host": "https://adb-7405611775517632.12.azuredatabricks.net"
+    }
+  ]
+}

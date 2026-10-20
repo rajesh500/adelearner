@@ -1,0 +1,329 @@
+{
+  "__locations": {
+    "files": [
+      "databricks.yml",
+      "resources/jobs/dab_demo_job.yml",
+      "resources/pipelines/dlt_dab_demo_orders.yml",
+      "resources/schemas/bronze_schema.yml",
+      "src/env/dev.yml",
+      "src/variables.yml"
+    ],
+    "locations": {
+      "bundle": [
+        [
+          0,
+          2,
+          3
+        ]
+      ],
+      "include": [
+        [
+          0,
+          5,
+          3
+        ]
+      ],
+      "permissions": [
+        [
+          0,
+          12,
+          3
+        ],
+        [
+          4,
+          4,
+          7
+        ]
+      ],
+      "presets": [
+        [
+          4,
+          8,
+          7
+        ]
+      ],
+      "resources": [
+        [
+          1,
+          2,
+          3
+        ],
+        [
+          2,
+          2,
+          3
+        ],
+        [
+          3,
+          2,
+          3
+        ]
+      ],
+      "resources.jobs": [
+        [
+          1,
+          3,
+          5
+        ]
+      ],
+      "resources.jobs.dab_demo_job": [
+        [
+          1,
+          4,
+          7
+        ]
+      ],
+      "resources.jobs.dab_demo_job.tasks": [
+        [
+          1,
+          6,
+          9
+        ]
+      ],
+      "resources.jobs.dab_demo_job.tasks[0]": [
+        [
+          1,
+          6,
+          11
+        ]
+      ],
+      "resources.pipelines": [
+        [
+          2,
+          3,
+          5
+        ]
+      ],
+      "resources.pipelines.pipeline_dlt_orders_pipeline": [
+        [
+          2,
+          4,
+          7
+        ]
+      ],
+      "resources.schemas": [
+        [
+          3,
+          3,
+          5
+        ]
+      ],
+      "resources.schemas.bronze_schema": [
+        [
+          3,
+          4,
+          7
+        ]
+      ],
+      "variables": [
+        [
+          5,
+          2,
+          3
+        ]
+      ],
+      "workspace": [
+        [
+          0,
+          20,
+          7
+        ]
+      ]
+    },
+    "version": 1
+  },
+  "bundle": {
+    "deployment": {
+      "lock": {
+        "enabled": false
+      }
+    },
+    "environment": "dev",
+    "git": {
+      "actual_branch": "feature/demo",
+      "branch": "feature/demo",
+      "bundle_root_path": ".",
+      "commit": "7938bd068f1d1fcad6d06538e47a6e4d9cc28e61",
+      "origin_url": "https://jakkularajeswari266@dev.azure.com/jakkularajeswari266/devrepo/_git/adb_cicd"
+    },
+    "mode": "development",
+    "name": "DABDemo",
+    "target": "dev"
+  },
+  "include": [
+    "src/variables.yml",
+    "src/env/dev.yml",
+    "src/env/qa.yml",
+    "resources/jobs/dab_demo_job.yml",
+    "resources/pipelines/dlt_dab_demo_orders.yml",
+    "resources/schemas/bronze_schema.yml"
+  ],
+  "permissions": [
+    {
+      "group_name": "de_grp",
+      "level": "CAN_MANAGE"
+    },
+    {
+      "group_name": "de_grp",
+      "level": "CAN_MANAGE"
+    }
+  ],
+  "presets": {
+    "jobs_max_concurrent_runs": 4,
+    "name_prefix": "(dev jakkularajeswari266)",
+    "pipelines_development": true,
+    "source_linked_deployment": false,
+    "tags": {
+      "dev": "jakkularajeswari266"
+    },
+    "trigger_pause_status": "PAUSED"
+  },
+  "resources": {
+    "jobs": {
+      "dab_demo_job": {
+        "deployment": {
+          "kind": "BUNDLE",
+          "metadata_file_path": "/Workspace/Users/jakkularajeswari266@gmail.com/.bundle/DABDemo/dev/state/metadata.json"
+        },
+        "edit_mode": "EDITABLE",
+        "format": "MULTI_TASK",
+        "id": "411586318284148",
+        "max_concurrent_runs": 4,
+        "name": "(dev jakkularajeswari266)dab_demo_job",
+        "permissions": [
+          {
+            "group_name": "de_grp",
+            "level": "CAN_MANAGE"
+          },
+          {
+            "level": "IS_OWNER",
+            "user_name": "jakkularajeswari266@gmail.com"
+          }
+        ],
+        "queue": {
+          "enabled": true
+        },
+        "tags": {
+          "dev": "jakkularajeswari266"
+        },
+        "tasks": [
+          {
+            "notebook_task": {
+              "notebook_path": "/Workspace/Users/jakkularajeswari266@gmail.com/.bundle/DABDemo/dev/files/resources/notebooks/demo_repo_notebook.py"
+            },
+            "task_key": "demo_notebook"
+          }
+        ],
+        "url": "https://adb-7405605275277665.5.azuredatabricks.net/jobs/411586318284148"
+      }
+    },
+    "pipelines": {
+      "pipeline_dlt_orders_pipeline": {
+        "catalog": "${resources.schemas.bronze_schema.catalog_name}",
+        "channel": "CURRENT",
+        "clusters": [
+          {
+            "label": "default",
+            "node_type_id": "Standard_D4ds_v5",
+            "num_workers": 1
+          }
+        ],
+        "deployment": {
+          "kind": "BUNDLE",
+          "metadata_file_path": "/Workspace/Users/jakkularajeswari266@gmail.com/.bundle/DABDemo/dev/state/metadata.json"
+        },
+        "development": true,
+        "edition": "ADVANCED",
+        "libraries": [
+          {
+            "notebook": {
+              "path": "/Workspace/Users/jakkularajeswari266@gmail.com/.bundle/DABDemo/dev/files/resources/notebooks/dlt_dab_demo_orders.sql.py"
+            }
+          }
+        ],
+        "modified_status": "created",
+        "name": "(dev jakkularajeswari266)dlt_orders_pipeline",
+        "permissions": [
+          {
+            "group_name": "de_grp",
+            "level": "CAN_MANAGE"
+          },
+          {
+            "level": "IS_OWNER",
+            "user_name": "jakkularajeswari266@gmail.com"
+          }
+        ],
+        "schema": "${resources.schemas.bronze_schema.name}",
+        "tags": {
+          "dev": "jakkularajeswari266"
+        }
+      }
+    },
+    "schemas": {
+      "bronze_schema": {
+        "catalog_name": "dabmain",
+        "modified_status": "created",
+        "name": "dev_jakkularajeswari266bronze"
+      }
+    }
+  },
+  "sync": {
+    "paths": [
+      "."
+    ]
+  },
+  "variables": {
+    "catalog": {
+      "default": "dabmain",
+      "description": "This is the name of the target catalog",
+      "value": "dabmain"
+    }
+  },
+  "workspace": {
+    "artifact_path": "/Workspace/Users/jakkularajeswari266@gmail.com/.bundle/DABDemo/dev/artifacts",
+    "current_user": {
+      "active": true,
+      "displayName": "Rajeswari Jakkula",
+      "domain_friendly_name": "jakkularajeswari266",
+      "emails": [
+        {
+          "primary": true,
+          "type": "work",
+          "value": "jakkularajeswari266@gmail.com"
+        }
+      ],
+      "externalId": "568014ed-f286-4a5e-8142-369b97fc18fe",
+      "groups": [
+        {
+          "$ref": "Groups/156531743134639",
+          "display": "admins",
+          "type": "direct",
+          "value": "156531743134639"
+        },
+        {
+          "$ref": "Groups/157147248955934",
+          "display": "users",
+          "type": "direct",
+          "value": "157147248955934"
+        }
+      ],
+      "id": "145640169072209",
+      "name": {
+        "familyName": "Jakkula",
+        "givenName": "Rajeswari"
+      },
+      "schemas": [
+        "urn:ietf:params:scim:schemas:core:2.0:User",
+        "urn:ietf:params:scim:schemas:extension:workspace:2.0:User"
+      ],
+      "short_name": "jakkularajeswari266",
+      "userName": "jakkularajeswari266@gmail.com"
+    },
+    "file_path": "/Workspace/Users/jakkularajeswari266@gmail.com/.bundle/DABDemo/dev/files",
+    "host": "https://adb-7405605275277665.5.azuredatabricks.net/",
+    "profile": "workspace_profile",
+    "resource_path": "/Workspace/Users/jakkularajeswari266@gmail.com/.bundle/DABDemo/dev/resources",
+    "root_path": "/Workspace/Users/jakkularajeswari266@gmail.com/.bundle/DABDemo/dev",
+    "state_path": "/Workspace/Users/jakkularajeswari266@gmail.com/.bundle/DABDemo/dev/state"
+  }
+}

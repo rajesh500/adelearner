@@ -1,0 +1,22 @@
+{
+  "chatMode": "Agent",
+  "threadId": "1829513274705091",
+  "toolExecutionPreference": "default",
+  "perToolExecutionPreferences": {},
+  "perThreadToolExecutionPreferences": {},
+  "perThreadLastUserMessageAt": {
+    "virtual-1": 1792344526279,
+    "2936619935097122": 1789844220558,
+    "3799750085764726": 1790042763724,
+    "2974903397991166": 1790049666054,
+    "1794061894343264": 1790301801644,
+    "2662040460372440": 1790984341350,
+    "4300227710507804": 1791845143258,
+    "704220022099388": 1792086805211,
+    "1829513274705091": 1792348305683
+  },
+  "autoApproveByDefault": true,
+  "extraSkillDirectories": [],
+  "disabledSkillNames": [],
+  "lastModified": 1792348305690
+}

@@ -1,0 +1,10 @@
+resources:
+  jobs:
+    dab_demo_job:
+      name: dab_demo_job
+      tasks:
+        - task_key: demo_notebook
+          notebook_task:
+            notebook_path: ../notebooks/demo_repo_notebook.py.py
+      queue:
+        enabled: true

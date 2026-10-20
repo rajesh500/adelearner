@@ -1,0 +1,14 @@
+{
+  "targets": [
+    {
+      "name": "dev",
+      "default": true,
+      "mode": "development",
+      "host": "\u003cdev workspace url\u003e"
+    },
+    {
+      "name": "qa",
+      "host": "\u003cqa workspace url\u003e"
+    }
+  ]
+}

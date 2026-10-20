@@ -1,0 +1,10 @@
+resources:
+  pipelines:
+    pipeline_dlt_orders_pipeline:
+      name: dlt_orders_pipeline
+      serverless: true
+      libraries:
+        - notebook:
+            path: ../notebooks/dlt_dab_demo_orders.sql.py.py
+      schema: ${resources.schemas.bronze_schema.name}
+      catalog: ${resources.schemas.bronze_schema.catalog_name}

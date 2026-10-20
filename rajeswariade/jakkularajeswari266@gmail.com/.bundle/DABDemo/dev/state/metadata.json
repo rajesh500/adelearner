@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "config": {
+    "bundle": {
+      "name": "DABDemo",
+      "target": "dev",
+      "mode": "development",
+      "git": {
+        "branch": "feature/demo",
+        "origin_url": "https://jakkularajeswari266@dev.azure.com/jakkularajeswari266/devrepo/_git/adb_cicd",
+        "commit": "7938bd068f1d1fcad6d06538e47a6e4d9cc28e61",
+        "bundle_root_path": "."
+      }
+    },
+    "workspace": {
+      "file_path": "/Workspace/Users/jakkularajeswari266@gmail.com/.bundle/DABDemo/dev/files"
+    },
+    "resources": {
+      "jobs": {
+        "dab_demo_job": {
+          "id": "411586318284148",
+          "relative_path": "resources/jobs/dab_demo_job.yml"
+        }
+      },
+      "pipelines": {
+        "pipeline_dlt_orders_pipeline": {
+          "id": "24e98beb-35b3-406c-862a-13613df0c481",
+          "relative_path": "resources/pipelines/dlt_dab_demo_orders.yml"
+        }
+      }
+    },
+    "presets": {
+      "source_linked_deployment": false
+    }
+  },
+  "extra": {
+    "git_folder_path": "/Workspace/Repos/jakkularajeswari266@gmail.com/adb_cicd"
+  }
+}

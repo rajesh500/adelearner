@@ -1,0 +1,122 @@
+{
+ "state_version": 3,
+ "cli_version": "1.17.0",
+ "lineage": "dc53892a-f8b1-4cd5-950a-50bb07707b42",
+ "serial": 3,
+ "state": {
+  "resources.jobs.dab_demo_job": {
+   "__id__": "411586318284148",
+   "state": {
+    "deployment": {
+     "kind": "BUNDLE",
+     "metadata_file_path": "/Workspace/Users/jakkularajeswari266@gmail.com/.bundle/DABDemo/dev/state/metadata.json"
+    },
+    "edit_mode": "UI_LOCKED",
+    "format": "MULTI_TASK",
+    "max_concurrent_runs": 4,
+    "name": "(dev jakkularajeswari266)dab_demo_job",
+    "queue": {
+     "enabled": true
+    },
+    "tags": {
+     "dev": "jakkularajeswari266"
+    },
+    "tasks": [
+     {
+      "notebook_task": {
+       "notebook_path": "/Workspace/Users/jakkularajeswari266@gmail.com/.bundle/DABDemo/dev/files/resources/notebooks/demo_repo_notebook.py"
+      },
+      "task_key": "demo_notebook"
+     }
+    ]
+   }
+  },
+  "resources.jobs.dab_demo_job.permissions": {
+   "__id__": "/jobs/411586318284148",
+   "state": {
+    "object_id": "/jobs/411586318284148",
+    "__embed__": [
+     {
+      "level": "CAN_MANAGE",
+      "group_name": "de_grp"
+     },
+     {
+      "level": "IS_OWNER",
+      "user_name": "jakkularajeswari266@gmail.com"
+     }
+    ]
+   },
+   "depends_on": [
+    {
+     "node": "resources.jobs.dab_demo_job",
+     "label": "${resources.jobs.dab_demo_job.id}"
+    }
+   ]
+  },
+  "resources.pipelines.pipeline_dlt_orders_pipeline": {
+   "__id__": "24e98beb-35b3-406c-862a-13613df0c481",
+   "state": {
+    "catalog": "rajeswariade",
+    "channel": "CURRENT",
+    "deployment": {
+     "kind": "BUNDLE",
+     "metadata_file_path": "/Workspace/Users/jakkularajeswari266@gmail.com/.bundle/DABDemo/dev/state/metadata.json"
+    },
+    "development": true,
+    "edition": "ADVANCED",
+    "libraries": [
+     {
+      "notebook": {
+       "path": "/Workspace/Users/jakkularajeswari266@gmail.com/.bundle/DABDemo/dev/files/resources/notebooks/dlt_dab_demo_orders.sql.py"
+      }
+     }
+    ],
+    "name": "(dev jakkularajeswari266)dlt_orders_pipeline",
+    "schema": "dev_jakkularajeswari266bronze",
+    "serverless": true,
+    "tags": {
+     "dev": "jakkularajeswari266"
+    }
+   },
+   "depends_on": [
+    {
+     "node": "resources.schemas.bronze_schema",
+     "label": "${resources.schemas.bronze_schema.catalog_name}"
+    },
+    {
+     "node": "resources.schemas.bronze_schema",
+     "label": "${resources.schemas.bronze_schema.name}"
+    }
+   ]
+  },
+  "resources.pipelines.pipeline_dlt_orders_pipeline.permissions": {
+   "__id__": "/pipelines/24e98beb-35b3-406c-862a-13613df0c481",
+   "state": {
+    "object_id": "/pipelines/24e98beb-35b3-406c-862a-13613df0c481",
+    "__embed__": [
+     {
+      "level": "CAN_MANAGE",
+      "group_name": "de_grp"
+     },
+     {
+      "level": "IS_OWNER",
+      "user_name": "jakkularajeswari266@gmail.com"
+     }
+    ]
+   },
+   "depends_on": [
+    {
+     "node": "resources.pipelines.pipeline_dlt_orders_pipeline",
+     "label": "${resources.pipelines.pipeline_dlt_orders_pipeline.id}"
+    }
+   ]
+  },
+  "resources.schemas.bronze_schema": {
+   "__id__": "rajeswariade.dev_jakkularajeswari266bronze",
+   "state": {
+    "catalog_name": "rajeswariade",
+    "name": "dev_jakkularajeswari266bronze"
+   }
+  }
+ }
+}

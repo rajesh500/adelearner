@@ -1,0 +1,2715 @@
+-- Databricks notebook source
+-- MAGIC %python
+-- MAGIC # Dedicated notebook runner for `databricks apps logs`, used only by the Apps
+-- MAGIC # assistant (AppsAgent) via the getAppsLogs tool. The app `/logz` endpoints sit
+-- MAGIC # behind the apps oauth2-proxy and reject the notebook's PAT, so this script
+-- MAGIC # exchanges the PAT for an OAuth access token (RFC 8693) and fetches the logs
+-- MAGIC # over REST. It intentionally does NOT shell out to the Databricks CLI: it needs
+-- MAGIC # no CLI/terraform/uv binaries, so none of that download machinery is here.
+-- MAGIC #
+-- MAGIC # The generic bundle runner (dabs_authoring/.../runner.py) stays product-neutral;
+-- MAGIC # keep this Apps-specific logic here, out of that critical shared path.
+-- MAGIC
+-- MAGIC
+-- MAGIC def _apps_logs_exchange_pat_for_oauth_token(workspace_url, pat, audience=None):
+-- MAGIC   import json
+-- MAGIC   import urllib.parse
+-- MAGIC   import urllib.request
+-- MAGIC
+-- MAGIC   data = {
+-- MAGIC     "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+-- MAGIC     "subject_token": pat,
+-- MAGIC     "subject_token_type": "urn:databricks:params:oauth:token-type:personal-access-token",
+-- MAGIC     "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+-- MAGIC     "scope": "all-apis",
+-- MAGIC   }
+-- MAGIC   if audience:
+-- MAGIC     data["audience"] = audience
+-- MAGIC
+-- MAGIC   encoded_data = urllib.parse.urlencode(data).encode("utf-8")
+-- MAGIC   request = urllib.request.Request(
+-- MAGIC     f"{workspace_url}/oidc/v1/token",
+-- MAGIC     method="POST",
+-- MAGIC     data=encoded_data,
+-- MAGIC     headers={"Content-Type": "application/x-www-form-urlencoded"},
+-- MAGIC   )
+-- MAGIC   try:
+-- MAGIC     with urllib.request.urlopen(request, timeout=30) as response:
+-- MAGIC       return json.loads(response.read().decode("utf-8"))["access_token"]
+-- MAGIC   except Exception as e:
+-- MAGIC     # Redact the exception detail: urllib errors can carry the request URL or the
+-- MAGIC     # server response body, either of which may include auth material. Surface
+-- MAGIC     # only the error type so a failed exchange stays debuggable without leaking.
+-- MAGIC     print(f"OAuth token exchange failed ({type(e).__name__})")
+-- MAGIC     return None
+-- MAGIC
+-- MAGIC
+-- MAGIC def _apps_logs_get_app(workspace_url, pat, app_name):
+-- MAGIC   import json
+-- MAGIC   import urllib.parse
+-- MAGIC   import urllib.request
+-- MAGIC
+-- MAGIC   encoded_app_name = urllib.parse.quote(app_name, safe="")
+-- MAGIC   request = urllib.request.Request(
+-- MAGIC     f"{workspace_url}/api/2.0/apps/{encoded_app_name}",
+-- MAGIC     method="GET",
+-- MAGIC     headers={"Authorization": f"Bearer {pat}"},
+-- MAGIC   )
+-- MAGIC   with urllib.request.urlopen(request, timeout=30) as response:
+-- MAGIC     return json.loads(response.read().decode("utf-8"))
+-- MAGIC
+-- MAGIC
+-- MAGIC def _apps_logs_build_url(app_url, search, source):
+-- MAGIC   import urllib.parse
+-- MAGIC
+-- MAGIC   normalized_app_url = app_url.rstrip("/")
+-- MAGIC   if not normalized_app_url.startswith(("http://", "https://")):
+-- MAGIC     normalized_app_url = f"https://{normalized_app_url}"
+-- MAGIC
+-- MAGIC   # SSRF guard: `app_url` comes from the apps API response and is used here as an
+-- MAGIC   # outbound request target. Only allow HTTPS to the Databricks apps domain so a
+-- MAGIC   # poisoned or unexpected `url` cannot redirect this fetch to an internal or
+-- MAGIC   # attacker-controlled host. (Gov clouds may use a different apps domain; extend
+-- MAGIC   # this suffix check if the runner is ever enabled there.)
+-- MAGIC   parsed = urllib.parse.urlparse(normalized_app_url)
+-- MAGIC   host = parsed.hostname or ""
+-- MAGIC   if parsed.scheme != "https" or not (host == "databricksapps.com" or host.endswith(".databricksapps.com")):
+-- MAGIC     raise RuntimeError(f"Refusing to fetch app logs from unexpected host: {host!r}")
+-- MAGIC
+-- MAGIC   query_params = []
+-- MAGIC   if search:
+-- MAGIC     query_params.append(("q", search))
+-- MAGIC   if source:
+-- MAGIC     query_params.append(("source", source))
+-- MAGIC
+-- MAGIC   query = urllib.parse.urlencode(query_params)
+-- MAGIC   if query:
+-- MAGIC     return f"{normalized_app_url}/logz/batch?{query}"
+-- MAGIC   return f"{normalized_app_url}/logz/batch"
+-- MAGIC
+-- MAGIC
+-- MAGIC def _apps_logs_fetch(url, oauth_token):
+-- MAGIC   import json
+-- MAGIC   import urllib.request
+-- MAGIC
+-- MAGIC   request = urllib.request.Request(
+-- MAGIC     url,
+-- MAGIC     method="GET",
+-- MAGIC     headers={"Authorization": f"Bearer {oauth_token}"},
+-- MAGIC   )
+-- MAGIC   with urllib.request.urlopen(request, timeout=30) as response:
+-- MAGIC     return json.loads(response.read().decode("utf-8"))
+-- MAGIC
+-- MAGIC
+-- MAGIC def _apps_logs_format_entry(entry):
+-- MAGIC   timestamp = entry.get("timestamp")
+-- MAGIC   source = entry.get("source")
+-- MAGIC   message = entry.get("message", "")
+-- MAGIC
+-- MAGIC   prefix_parts = []
+-- MAGIC   if timestamp is not None:
+-- MAGIC     prefix_parts.append(str(timestamp))
+-- MAGIC   if source:
+-- MAGIC     prefix_parts.append(f"[{source}]")
+-- MAGIC
+-- MAGIC   if prefix_parts:
+-- MAGIC     return f"{' '.join(prefix_parts)} {message}"
+-- MAGIC   return str(message)
+-- MAGIC
+-- MAGIC
+-- MAGIC def _apps_logs_run(app_name, tail_lines, search, source, workspace_url, pat):
+-- MAGIC   import urllib.error
+-- MAGIC
+-- MAGIC   app = _apps_logs_get_app(workspace_url, pat, app_name)
+-- MAGIC   app_url = app.get("url")
+-- MAGIC   if not app_url:
+-- MAGIC     raise RuntimeError(f"Could not retrieve URL for app {app_name}")
+-- MAGIC
+-- MAGIC   oauth_token = _apps_logs_exchange_pat_for_oauth_token(workspace_url, pat)
+-- MAGIC   if not oauth_token:
+-- MAGIC     # The /logz endpoints reject PATs, so there is no usable fallback. Fail fast
+-- MAGIC     # with an actionable message instead of a confusing downstream auth error.
+-- MAGIC     raise RuntimeError(
+-- MAGIC       "OAuth token exchange failed for `apps logs`; the app /logz endpoints require "
+-- MAGIC       "OAuth and reject PAT auth, so logs cannot be retrieved in the notebook runner."
+-- MAGIC     )
+-- MAGIC
+-- MAGIC   logs_url = _apps_logs_build_url(app_url, search, source)
+-- MAGIC   try:
+-- MAGIC     entries = _apps_logs_fetch(logs_url, oauth_token)
+-- MAGIC   except urllib.error.HTTPError as e:
+-- MAGIC     # Some apps require a token scoped to the app's own OAuth client rather than
+-- MAGIC     # the workspace-wide token; on an auth rejection, retry once with that audience.
+-- MAGIC     audience = app.get("oauth2_app_client_id")
+-- MAGIC     if e.code not in (401, 403) or not audience:
+-- MAGIC       raise
+-- MAGIC     audience_token = _apps_logs_exchange_pat_for_oauth_token(workspace_url, pat, audience=audience)
+-- MAGIC     if not audience_token:
+-- MAGIC       raise
+-- MAGIC     entries = _apps_logs_fetch(logs_url, audience_token)
+-- MAGIC
+-- MAGIC   if tail_lines > 0:
+-- MAGIC     entries = entries[-tail_lines:]
+-- MAGIC
+-- MAGIC   output = "".join(
+-- MAGIC     line if line.endswith("\n") else f"{line}\n"
+-- MAGIC     for line in (_apps_logs_format_entry(entry) for entry in entries)
+-- MAGIC   )
+-- MAGIC   print(output, end="")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _apps_logs_runner():
+-- MAGIC   from dbruntime.databricks_repl_context import get_context
+-- MAGIC
+-- MAGIC   app_name = "simple-customer-api"
+-- MAGIC   tail_lines = int("100")
+-- MAGIC   search = "" or None
+-- MAGIC   source = "" or None
+-- MAGIC
+-- MAGIC   ctx = get_context()
+-- MAGIC   pat = ctx.apiToken
+-- MAGIC   workspace_url = f"https://{spark.conf.get('spark.databricks.workspaceUrl')}"
+-- MAGIC
+-- MAGIC   _apps_logs_run(app_name, tail_lines, search, source, workspace_url, pat)
+-- MAGIC
+-- MAGIC
+-- MAGIC try:
+-- MAGIC   _apps_logs_runner()
+-- MAGIC finally:
+-- MAGIC   del (
+-- MAGIC     _apps_logs_runner,
+-- MAGIC     _apps_logs_exchange_pat_for_oauth_token,
+-- MAGIC     _apps_logs_get_app,
+-- MAGIC     _apps_logs_build_url,
+-- MAGIC     _apps_logs_fetch,
+-- MAGIC     _apps_logs_format_entry,
+-- MAGIC     _apps_logs_run,
+-- MAGIC   )
+-- MAGIC None
+
+-- COMMAND ----------
+
+python: can't open file '/app/python/source_code/app.py': [Errno 2] No such file or directory
+
+-- COMMAND ----------
+
+python: can't open file '/app/python/source_code/app.py': [Errno 2] No such file or directory
+
+-- COMMAND ----------
+
+python: can't open file '/app/python/source_code/app.py': [Errno 2] No such file or directory
+
+-- COMMAND ----------
+
+databricks apps deploy simple-customer-api --source-code-path /Workspace/Users/jakkularajeswari266@gmail.com/simple-customer-api
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC # Dedicated notebook runner for `databricks apps logs`, used only by the Apps
+-- MAGIC # assistant (AppsAgent) via the getAppsLogs tool. The app `/logz` endpoints sit
+-- MAGIC # behind the apps oauth2-proxy and reject the notebook's PAT, so this script
+-- MAGIC # exchanges the PAT for an OAuth access token (RFC 8693) and fetches the logs
+-- MAGIC # over REST. It intentionally does NOT shell out to the Databricks CLI: it needs
+-- MAGIC # no CLI/terraform/uv binaries, so none of that download machinery is here.
+-- MAGIC #
+-- MAGIC # The generic bundle runner (dabs_authoring/.../runner.py) stays product-neutral;
+-- MAGIC # keep this Apps-specific logic here, out of that critical shared path.
+-- MAGIC
+-- MAGIC
+-- MAGIC def _apps_logs_exchange_pat_for_oauth_token(workspace_url, pat, audience=None):
+-- MAGIC   import json
+-- MAGIC   import urllib.parse
+-- MAGIC   import urllib.request
+-- MAGIC
+-- MAGIC   data = {
+-- MAGIC     "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+-- MAGIC     "subject_token": pat,
+-- MAGIC     "subject_token_type": "urn:databricks:params:oauth:token-type:personal-access-token",
+-- MAGIC     "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+-- MAGIC     "scope": "all-apis",
+-- MAGIC   }
+-- MAGIC   if audience:
+-- MAGIC     data["audience"] = audience
+-- MAGIC
+-- MAGIC   encoded_data = urllib.parse.urlencode(data).encode("utf-8")
+-- MAGIC   request = urllib.request.Request(
+-- MAGIC     f"{workspace_url}/oidc/v1/token",
+-- MAGIC     method="POST",
+-- MAGIC     data=encoded_data,
+-- MAGIC     headers={"Content-Type": "application/x-www-form-urlencoded"},
+-- MAGIC   )
+-- MAGIC   try:
+-- MAGIC     with urllib.request.urlopen(request, timeout=30) as response:
+-- MAGIC       return json.loads(response.read().decode("utf-8"))["access_token"]
+-- MAGIC   except Exception as e:
+-- MAGIC     # Redact the exception detail: urllib errors can carry the request URL or the
+-- MAGIC     # server response body, either of which may include auth material. Surface
+-- MAGIC     # only the error type so a failed exchange stays debuggable without leaking.
+-- MAGIC     print(f"OAuth token exchange failed ({type(e).__name__})")
+-- MAGIC     return None
+-- MAGIC
+-- MAGIC
+-- MAGIC def _apps_logs_get_app(workspace_url, pat, app_name):
+-- MAGIC   import json
+-- MAGIC   import urllib.parse
+-- MAGIC   import urllib.request
+-- MAGIC
+-- MAGIC   encoded_app_name = urllib.parse.quote(app_name, safe="")
+-- MAGIC   request = urllib.request.Request(
+-- MAGIC     f"{workspace_url}/api/2.0/apps/{encoded_app_name}",
+-- MAGIC     method="GET",
+-- MAGIC     headers={"Authorization": f"Bearer {pat}"},
+-- MAGIC   )
+-- MAGIC   with urllib.request.urlopen(request, timeout=30) as response:
+-- MAGIC     return json.loads(response.read().decode("utf-8"))
+-- MAGIC
+-- MAGIC
+-- MAGIC def _apps_logs_build_url(app_url, search, source):
+-- MAGIC   import urllib.parse
+-- MAGIC
+-- MAGIC   normalized_app_url = app_url.rstrip("/")
+-- MAGIC   if not normalized_app_url.startswith(("http://", "https://")):
+-- MAGIC     normalized_app_url = f"https://{normalized_app_url}"
+-- MAGIC
+-- MAGIC   # SSRF guard: `app_url` comes from the apps API response and is used here as an
+-- MAGIC   # outbound request target. Only allow HTTPS to the Databricks apps domain so a
+-- MAGIC   # poisoned or unexpected `url` cannot redirect this fetch to an internal or
+-- MAGIC   # attacker-controlled host. (Gov clouds may use a different apps domain; extend
+-- MAGIC   # this suffix check if the runner is ever enabled there.)
+-- MAGIC   parsed = urllib.parse.urlparse(normalized_app_url)
+-- MAGIC   host = parsed.hostname or ""
+-- MAGIC   if parsed.scheme != "https" or not (host == "databricksapps.com" or host.endswith(".databricksapps.com")):
+-- MAGIC     raise RuntimeError(f"Refusing to fetch app logs from unexpected host: {host!r}")
+-- MAGIC
+-- MAGIC   query_params = []
+-- MAGIC   if search:
+-- MAGIC     query_params.append(("q", search))
+-- MAGIC   if source:
+-- MAGIC     query_params.append(("source", source))
+-- MAGIC
+-- MAGIC   query = urllib.parse.urlencode(query_params)
+-- MAGIC   if query:
+-- MAGIC     return f"{normalized_app_url}/logz/batch?{query}"
+-- MAGIC   return f"{normalized_app_url}/logz/batch"
+-- MAGIC
+-- MAGIC
+-- MAGIC def _apps_logs_fetch(url, oauth_token):
+-- MAGIC   import json
+-- MAGIC   import urllib.request
+-- MAGIC
+-- MAGIC   request = urllib.request.Request(
+-- MAGIC     url,
+-- MAGIC     method="GET",
+-- MAGIC     headers={"Authorization": f"Bearer {oauth_token}"},
+-- MAGIC   )
+-- MAGIC   with urllib.request.urlopen(request, timeout=30) as response:
+-- MAGIC     return json.loads(response.read().decode("utf-8"))
+-- MAGIC
+-- MAGIC
+-- MAGIC def _apps_logs_format_entry(entry):
+-- MAGIC   timestamp = entry.get("timestamp")
+-- MAGIC   source = entry.get("source")
+-- MAGIC   message = entry.get("message", "")
+-- MAGIC
+-- MAGIC   prefix_parts = []
+-- MAGIC   if timestamp is not None:
+-- MAGIC     prefix_parts.append(str(timestamp))
+-- MAGIC   if source:
+-- MAGIC     prefix_parts.append(f"[{source}]")
+-- MAGIC
+-- MAGIC   if prefix_parts:
+-- MAGIC     return f"{' '.join(prefix_parts)} {message}"
+-- MAGIC   return str(message)
+-- MAGIC
+-- MAGIC
+-- MAGIC def _apps_logs_run(app_name, tail_lines, search, source, workspace_url, pat):
+-- MAGIC   import urllib.error
+-- MAGIC
+-- MAGIC   app = _apps_logs_get_app(workspace_url, pat, app_name)
+-- MAGIC   app_url = app.get("url")
+-- MAGIC   if not app_url:
+-- MAGIC     raise RuntimeError(f"Could not retrieve URL for app {app_name}")
+-- MAGIC
+-- MAGIC   oauth_token = _apps_logs_exchange_pat_for_oauth_token(workspace_url, pat)
+-- MAGIC   if not oauth_token:
+-- MAGIC     # The /logz endpoints reject PATs, so there is no usable fallback. Fail fast
+-- MAGIC     # with an actionable message instead of a confusing downstream auth error.
+-- MAGIC     raise RuntimeError(
+-- MAGIC       "OAuth token exchange failed for `apps logs`; the app /logz endpoints require "
+-- MAGIC       "OAuth and reject PAT auth, so logs cannot be retrieved in the notebook runner."
+-- MAGIC     )
+-- MAGIC
+-- MAGIC   logs_url = _apps_logs_build_url(app_url, search, source)
+-- MAGIC   try:
+-- MAGIC     entries = _apps_logs_fetch(logs_url, oauth_token)
+-- MAGIC   except urllib.error.HTTPError as e:
+-- MAGIC     # Some apps require a token scoped to the app's own OAuth client rather than
+-- MAGIC     # the workspace-wide token; on an auth rejection, retry once with that audience.
+-- MAGIC     audience = app.get("oauth2_app_client_id")
+-- MAGIC     if e.code not in (401, 403) or not audience:
+-- MAGIC       raise
+-- MAGIC     audience_token = _apps_logs_exchange_pat_for_oauth_token(workspace_url, pat, audience=audience)
+-- MAGIC     if not audience_token:
+-- MAGIC       raise
+-- MAGIC     entries = _apps_logs_fetch(logs_url, audience_token)
+-- MAGIC
+-- MAGIC   if tail_lines > 0:
+-- MAGIC     entries = entries[-tail_lines:]
+-- MAGIC
+-- MAGIC   output = "".join(
+-- MAGIC     line if line.endswith("\n") else f"{line}\n"
+-- MAGIC     for line in (_apps_logs_format_entry(entry) for entry in entries)
+-- MAGIC   )
+-- MAGIC   print(output, end="")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _apps_logs_runner():
+-- MAGIC   from dbruntime.databricks_repl_context import get_context
+-- MAGIC
+-- MAGIC   app_name = "simple-customer-api"
+-- MAGIC   tail_lines = int("20")
+-- MAGIC   search = "can't open file" or None
+-- MAGIC   source = "" or None
+-- MAGIC
+-- MAGIC   ctx = get_context()
+-- MAGIC   pat = ctx.apiToken
+-- MAGIC   workspace_url = f"https://{spark.conf.get('spark.databricks.workspaceUrl')}"
+-- MAGIC
+-- MAGIC   _apps_logs_run(app_name, tail_lines, search, source, workspace_url, pat)
+-- MAGIC
+-- MAGIC
+-- MAGIC try:
+-- MAGIC   _apps_logs_runner()
+-- MAGIC finally:
+-- MAGIC   del (
+-- MAGIC     _apps_logs_runner,
+-- MAGIC     _apps_logs_exchange_pat_for_oauth_token,
+-- MAGIC     _apps_logs_get_app,
+-- MAGIC     _apps_logs_build_url,
+-- MAGIC     _apps_logs_fetch,
+-- MAGIC     _apps_logs_format_entry,
+-- MAGIC     _apps_logs_run,
+-- MAGIC   )
+-- MAGIC None
+
+-- COMMAND ----------
+
+databricks apps deploy simple-customer-api --source-code-path /Workspace/Users/jakkularajeswari266@gmail.com/simple-customer-api
+
+-- COMMAND ----------
+
+databricks apps deploy simple-customer-api --source-code-path /Workspace/Users/jakkularajeswari266@gmail.com/simple-customer-api
+
+-- COMMAND ----------
+
+/Workspace/Users/jakkularajeswari266@gmail.com/simple-customer-api
+
+-- COMMAND ----------
+
+databricks apps deploy simple-customer-api --source-code-path /Workspace/Users/jakkularajeswari266@gmail.com/simple-customer-api
+
+-- COMMAND ----------
+
+python: can't open file '/app/python/source_code/app.py': [Errno 2] No such file or directory
+
+-- COMMAND ----------
+
+databricks apps deploy simple-customer-api --source-code-path /Workspace/Users/jakkularajeswari266@gmail.com/simple-customer-api
+
+-- COMMAND ----------
+
+databricks apps deploy simple-customer-api --source-code-path /Workspace/Users/jakkularajeswari266@gmail.com/simple-customer-api
+
+-- COMMAND ----------
+
+
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC def _cli_runner_get_venv_path_from_databricks_yml(cwd):
+-- MAGIC   import yaml
+-- MAGIC
+-- MAGIC   databricks_yml_path = f"{cwd}/databricks.yml"
+-- MAGIC   with open(databricks_yml_path, "r") as f:
+-- MAGIC     data = yaml.safe_load(f)
+-- MAGIC     return data.get("python", {}).get("venv_path", ".venv")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_run_cli_command(cli_command, cwd, tmp_file_path, include_stderr, env, *, cli_upstream):
+-- MAGIC   import os
+-- MAGIC   import subprocess
+-- MAGIC
+-- MAGIC   stderr_arg = subprocess.PIPE if include_stderr else None
+-- MAGIC   if tmp_file_path:
+-- MAGIC     os.makedirs(os.path.dirname(tmp_file_path), exist_ok=True)
+-- MAGIC     result = subprocess.run(cli_command, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr_arg, text=True, env=env)
+-- MAGIC     with open(tmp_file_path, 'w') as output_file:
+-- MAGIC         output_file.write(result.stdout)
+-- MAGIC         print(result.stdout)
+-- MAGIC   else:
+-- MAGIC     result = subprocess.run(cli_command, cwd=cwd, stderr=stderr_arg, text=True, env=env)
+-- MAGIC   if result.returncode != 0:
+-- MAGIC     error_msg = f"Command {result.args[:3]} failed with exit code {result.returncode}"
+-- MAGIC     if include_stderr and result.stderr:
+-- MAGIC       error_msg += f":\n{result.stderr}"
+-- MAGIC     raise RuntimeError(error_msg)
+-- MAGIC
+-- MAGIC   if cli_upstream == "genie-code":
+-- MAGIC     print(result.stderr)
+-- MAGIC
+-- MAGIC     try:
+-- MAGIC       with open("/Workspace/.proc/self/status", "r") as status_file:
+-- MAGIC         status_file.read()
+-- MAGIC     except Exception as e:
+-- MAGIC       print(f"Warning: Failed to read /Workspace/.proc/self/status: {e}")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_run_cli_command_with_token(cli_command, cwd, tmp_file_path, include_stderr, token, env, *, cli_upstream):
+-- MAGIC   _cli_runner_run_cli_command(
+-- MAGIC     cli_command,
+-- MAGIC     cwd,
+-- MAGIC     tmp_file_path,
+-- MAGIC     include_stderr,
+-- MAGIC     {**env, "DATABRICKS_TOKEN": token},
+-- MAGIC     cli_upstream=cli_upstream,
+-- MAGIC   )
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_get_download_url(workspace_url, token, file_api_path, runner_download_error_marker):
+-- MAGIC   import requests
+-- MAGIC   import time
+-- MAGIC
+-- MAGIC   api_create_download_url = f"{workspace_url}/api/2.0/fs/create-download-url"
+-- MAGIC   headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+-- MAGIC   data = {"path": file_api_path}
+-- MAGIC
+-- MAGIC   max_attempts = 3
+-- MAGIC   last_error = None
+-- MAGIC   for attempt in range(max_attempts):
+-- MAGIC     try:
+-- MAGIC       response = requests.post(api_create_download_url, headers=headers, json=data)
+-- MAGIC       if response.status_code == 200:
+-- MAGIC         return response.json()["url"]
+-- MAGIC       last_error = f"HTTP {response.status_code} {response.text}"
+-- MAGIC     except requests.RequestException as e:
+-- MAGIC       last_error = str(e)
+-- MAGIC     if attempt < max_attempts - 1:
+-- MAGIC       time.sleep(2 ** attempt)
+-- MAGIC
+-- MAGIC   print(f"{runner_download_error_marker}: {file_api_path} {last_error}")
+-- MAGIC   raise RuntimeError(f"Failed to download {file_api_path}: {last_error}")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _databricks_cli_runner():
+-- MAGIC   import hashlib
+-- MAGIC   import os
+-- MAGIC   import platform
+-- MAGIC   import requests
+-- MAGIC   import shlex
+-- MAGIC   import shutil
+-- MAGIC   import subprocess
+-- MAGIC   import tempfile
+-- MAGIC   import time
+-- MAGIC   import zipfile
+-- MAGIC   from dbruntime.databricks_repl_context import get_context
+-- MAGIC   from urllib.parse import urlparse
+-- MAGIC
+-- MAGIC   cli_version = "1.20.0"
+-- MAGIC   terraform_version = ""
+-- MAGIC   provider_version = ""
+-- MAGIC   cwd = ""
+-- MAGIC   args = "apps get simple-customer-api --output JSON"
+-- MAGIC   tmp_file = ""
+-- MAGIC   dev_cli_snippet = ""
+-- MAGIC   artifact_download_error_prefix = "DABsRunnerError: Failed to download CLI dependency"
+-- MAGIC   runner_download_error_marker = "DabsRunnerErrorFallback: Downloading error, using fallback URL"
+-- MAGIC   allow_python_execution = "false"
+-- MAGIC   enable_yaml_sync = "true"
+-- MAGIC   include_stderr_in_error = "true"
+-- MAGIC   cli_upstream = "genie-code"
+-- MAGIC   enforce_serverless = "true"
+-- MAGIC   use_context_api_url = "false"
+-- MAGIC
+-- MAGIC   if enforce_serverless == "true" and os.environ.get("IS_SERVERLESS", "").strip().lower() != "true":
+-- MAGIC     raise RuntimeError("Databricks CLI runner must run on serverless compute")
+-- MAGIC
+-- MAGIC   setup_runner_environment_start = time.monotonic()
+-- MAGIC   ctx = get_context()
+-- MAGIC   token = ctx.apiToken
+-- MAGIC   if use_context_api_url == "true":
+-- MAGIC     workspace_url = f"https://{urlparse(ctx.apiUrl).netloc}"
+-- MAGIC   else:
+-- MAGIC     workspace_url = f"https://{spark.conf.get('spark.databricks.workspaceUrl')}"
+-- MAGIC   cpu_arch = "linux_arm64" if platform.machine() == "aarch64" else "linux_amd64"
+-- MAGIC
+-- MAGIC   env = os.environ.copy()
+-- MAGIC
+-- MAGIC   def emit_event(phase, start_time):
+-- MAGIC     print(f"\n__RUNNER_PHASE__:{phase}:{(time.monotonic() - start_time) * 1000:.0f}", flush=True)
+-- MAGIC
+-- MAGIC   def get_download_url(file_api_path):
+-- MAGIC     return _cli_runner_get_download_url(
+-- MAGIC       workspace_url, token, file_api_path, runner_download_error_marker
+-- MAGIC     )
+-- MAGIC
+-- MAGIC   def download_and_extract(file_url, dest_dir):
+-- MAGIC     response = requests.get(file_url)
+-- MAGIC     if response.status_code != 200:
+-- MAGIC       raise RuntimeError(f"HTTP {response.status_code} while downloading artifact: {response.text}")
+-- MAGIC     tmp_file = f"{dest_dir}.zip"
+-- MAGIC
+-- MAGIC     with open(tmp_file, "wb") as zip_file:
+-- MAGIC         zip_file.write(response.content)
+-- MAGIC     with zipfile.ZipFile(tmp_file, 'r') as zip_ref:
+-- MAGIC         zip_ref.extractall(dest_dir)
+-- MAGIC
+-- MAGIC   def download_artifact_if_not_exists(input_file_name, binary_name, dest_path, tmp_dir):
+-- MAGIC     if os.path.exists(dest_path):
+-- MAGIC       return
+-- MAGIC
+-- MAGIC     try:
+-- MAGIC       os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+-- MAGIC
+-- MAGIC       path_prefix = f"/DatabricksInternal/Jobs/ArtifactRepository/public/databricks-cli-binaries/{cli_version}"
+-- MAGIC       download_url = get_download_url(f"{path_prefix}/{input_file_name}.zip")
+-- MAGIC
+-- MAGIC       tmp_archive_dir = f"{tmp_dir}/{input_file_name}"
+-- MAGIC       download_and_extract(download_url, tmp_archive_dir)
+-- MAGIC
+-- MAGIC       src_path = f"{tmp_archive_dir}/{binary_name}"
+-- MAGIC       if not os.path.exists(src_path):
+-- MAGIC         available = ", ".join(os.listdir(tmp_archive_dir)) if os.path.isdir(tmp_archive_dir) else "(missing archive directory)"
+-- MAGIC         raise RuntimeError(f"Expected binary '{binary_name}' not found in archive contents: {available}")
+-- MAGIC
+-- MAGIC       shutil.move(src_path, dest_path)
+-- MAGIC       os.chmod(dest_path, 0o755)
+-- MAGIC     except Exception as e:
+-- MAGIC       versions_info = f"CLI v{cli_version}, TF v{terraform_version}, TF provider v{provider_version}" if terraform_version else f"CLI v{cli_version}"
+-- MAGIC       error_msg = f"{artifact_download_error_prefix} {input_file_name}/{binary_name} {versions_info}: {str(e)}"
+-- MAGIC       raise RuntimeError(f"{error_msg}")
+-- MAGIC
+-- MAGIC   tmp_base = os.path.expanduser("~/tmp")
+-- MAGIC   if not os.path.exists(tmp_base):
+-- MAGIC     os.makedirs(tmp_base)
+-- MAGIC   os.chmod(tmp_base, 0o700)
+-- MAGIC
+-- MAGIC   with tempfile.TemporaryDirectory(dir=tmp_base) as tmpdirname:
+-- MAGIC       emit_event("setup_runner_environment", setup_runner_environment_start)
+-- MAGIC
+-- MAGIC       download_artifacts_start = time.monotonic()
+-- MAGIC       cli_exec_path = f"{tmp_base}/databricks_{cli_version}_{cpu_arch}"
+-- MAGIC       download_artifact_if_not_exists(
+-- MAGIC         f"databricks_cli_{cpu_arch}",
+-- MAGIC         "databricks",
+-- MAGIC         cli_exec_path,
+-- MAGIC         tmpdirname
+-- MAGIC       )
+-- MAGIC
+-- MAGIC       if terraform_version:
+-- MAGIC         terraform_base = f"{tmp_base}/terraform"
+-- MAGIC         terraform_exec_path = f"{terraform_base}/terraform_{terraform_version}_{cpu_arch}"
+-- MAGIC         download_artifact_if_not_exists(
+-- MAGIC           f"terraform_{cpu_arch}",
+-- MAGIC           "terraform",
+-- MAGIC           terraform_exec_path,
+-- MAGIC           tmpdirname
+-- MAGIC         )
+-- MAGIC
+-- MAGIC         provider_mirror_base = f"{terraform_base}/providers"
+-- MAGIC         provider_mirror_dir = f"{provider_mirror_base}/registry.terraform.io/databricks/databricks/{provider_version}/{cpu_arch}"
+-- MAGIC         os.makedirs(provider_mirror_dir, exist_ok=True)
+-- MAGIC         provider_exec_path = f"{provider_mirror_dir}/terraform-provider-databricks_v{provider_version}"
+-- MAGIC         download_artifact_if_not_exists(
+-- MAGIC           f"terraform_provider_{cpu_arch}",
+-- MAGIC           f"terraform-provider-databricks_v{provider_version}",
+-- MAGIC           provider_exec_path,
+-- MAGIC           tmpdirname
+-- MAGIC         )
+-- MAGIC       emit_event("download_artifacts", download_artifacts_start)
+-- MAGIC
+-- MAGIC       setup_cli_environment_start = time.monotonic()
+-- MAGIC       if terraform_version:
+-- MAGIC         terraform_cli_config_path = f"{terraform_base}/terraform-cli-config"
+-- MAGIC         if not os.path.exists(terraform_cli_config_path):
+-- MAGIC           terraform_cli_config = f'''provider_installation {{
+-- MAGIC   filesystem_mirror {{
+-- MAGIC     path    = "{provider_mirror_base}"
+-- MAGIC     include = ["registry.terraform.io/databricks/databricks"]
+-- MAGIC   }}
+-- MAGIC   direct {{
+-- MAGIC     exclude = ["registry.terraform.io/databricks/databricks"]
+-- MAGIC   }}
+-- MAGIC }}
+-- MAGIC disable_checkpoint = true
+-- MAGIC disable_checkpoint_signature = true
+-- MAGIC '''
+-- MAGIC
+-- MAGIC           with open(terraform_cli_config_path, 'w') as f:
+-- MAGIC             f.write(terraform_cli_config)
+-- MAGIC
+-- MAGIC         env["DATABRICKS_TF_VERSION"] = terraform_version
+-- MAGIC         env["DATABRICKS_TF_EXEC_PATH"] = terraform_exec_path
+-- MAGIC         env["DATABRICKS_TF_PROVIDER_VERSION"] = provider_version
+-- MAGIC         env["DATABRICKS_TF_CLI_CONFIG_FILE"] = terraform_cli_config_path
+-- MAGIC         env["TF_CLI_CONFIG_FILE"] = terraform_cli_config_path
+-- MAGIC
+-- MAGIC       cwd = os.path.normpath(f"/Workspace{cwd}")
+-- MAGIC
+-- MAGIC       if dev_cli_snippet:
+-- MAGIC         cli_path = cli_exec_path
+-- MAGIC         exec(dev_cli_snippet, globals(), locals())
+-- MAGIC
+-- MAGIC       env["DATABRICKS_BUNDLE_TMP"] = f"{tmp_base}/bundle-2-{hashlib.sha256(cwd.encode()).hexdigest()}"
+-- MAGIC       env["DATABRICKS_CLI_UPSTREAM"] = cli_upstream
+-- MAGIC
+-- MAGIC       if enable_yaml_sync == "true":
+-- MAGIC         env["DATABRICKS_BUNDLE_ENABLE_EXPERIMENTAL_YAML_SYNC"] = "1"
+-- MAGIC       else:
+-- MAGIC         env.pop("DATABRICKS_BUNDLE_ENABLE_EXPERIMENTAL_YAML_SYNC", None)
+-- MAGIC
+-- MAGIC       env["DATABRICKS_BUNDLE_ENGINE"] = "direct"
+-- MAGIC
+-- MAGIC       emit_event("setup_cli_environment", setup_cli_environment_start)
+-- MAGIC
+-- MAGIC       if allow_python_execution == "true":
+-- MAGIC         install_dependencies_start = time.monotonic()
+-- MAGIC         venv_path = _cli_runner_get_venv_path_from_databricks_yml(cwd)
+-- MAGIC         venv_folder_path = os.path.normpath(f"{cwd}/{venv_path}")
+-- MAGIC         venv_bin_path = f"{venv_folder_path}/bin"
+-- MAGIC
+-- MAGIC         os.makedirs(venv_bin_path, exist_ok=True)
+-- MAGIC
+-- MAGIC         python3_wrapper_path = f"{venv_bin_path}/python3"
+-- MAGIC         if not os.path.exists(python3_wrapper_path):
+-- MAGIC           with open(python3_wrapper_path, "w") as f:
+-- MAGIC             f.write('#!/usr/bin/env bash\nexec python3 "$@"\n')
+-- MAGIC           os.chmod(python3_wrapper_path, 0o755)
+-- MAGIC
+-- MAGIC         pyvenv_cfg_path = f"{venv_folder_path}/pyvenv.cfg"
+-- MAGIC         if not os.path.exists(pyvenv_cfg_path):
+-- MAGIC           with open(pyvenv_cfg_path, "w") as f:
+-- MAGIC             pass
+-- MAGIC
+-- MAGIC         pyproject_path = f"{cwd}/pyproject.toml"
+-- MAGIC         uv_pip_install_args = ["uv", "pip", "install", "--quiet", "--python", python3_wrapper_path, "--link-mode=copy"]
+-- MAGIC
+-- MAGIC         override_file = None
+-- MAGIC         if os.path.exists(pyproject_path):
+-- MAGIC           uv_pip_install_args.extend(["-r", pyproject_path, "--group", "dev"])
+-- MAGIC         else:
+-- MAGIC           uv_pip_install_args.append(f"databricks-bundles=={cli_version}")
+-- MAGIC
+-- MAGIC         try:
+-- MAGIC           subprocess.run(uv_pip_install_args, check=True, cwd=cwd, stdout=subprocess.DEVNULL, env=env)
+-- MAGIC         finally:
+-- MAGIC           if override_file and os.path.exists(override_file):
+-- MAGIC             os.remove(override_file)
+-- MAGIC         emit_event("install_dependencies", install_dependencies_start)
+-- MAGIC
+-- MAGIC         env.pop("DATABRICKS_BUNDLE_RESTRICTED_CODE_EXECUTION", None)
+-- MAGIC       else:
+-- MAGIC         env["DATABRICKS_BUNDLE_RESTRICTED_CODE_EXECUTION"] = "1"
+-- MAGIC
+-- MAGIC       env.pop("DATABRICKS_CLUSTER_ID", None)
+-- MAGIC
+-- MAGIC       with tempfile.NamedTemporaryFile(mode='w+', dir=tmpdirname, delete=True) as databrickscfg_file:
+-- MAGIC           profile_name = "workspace_profile"
+-- MAGIC           databrickscfg_file.write(f"[workspace_profile]\nhost = {workspace_url}")
+-- MAGIC           databrickscfg_file.flush()
+-- MAGIC           env["DATABRICKS_CONFIG_FILE"] = databrickscfg_file.name
+-- MAGIC
+-- MAGIC           cli_command = [cli_exec_path] + shlex.split(args) + ["-p", profile_name]
+-- MAGIC           tmp_file_path = tmp_file
+-- MAGIC
+-- MAGIC           run_cli_start = time.monotonic()
+-- MAGIC           run_cli_phase = "run_cli_genie" if cli_upstream == "genie-code" else "run_cli"
+-- MAGIC           try:
+-- MAGIC             _cli_runner_run_cli_command_with_token(
+-- MAGIC               cli_command,
+-- MAGIC               cwd,
+-- MAGIC               tmp_file_path,
+-- MAGIC               include_stderr_in_error == "true",
+-- MAGIC               token,
+-- MAGIC               env,
+-- MAGIC               cli_upstream=cli_upstream,
+-- MAGIC             )
+-- MAGIC           finally:
+-- MAGIC             emit_event(run_cli_phase, run_cli_start)
+-- MAGIC
+-- MAGIC
+-- MAGIC try:
+-- MAGIC   _databricks_cli_runner()
+-- MAGIC finally:
+-- MAGIC   del (
+-- MAGIC     _databricks_cli_runner,
+-- MAGIC     _cli_runner_get_venv_path_from_databricks_yml,
+-- MAGIC     _cli_runner_get_download_url,
+-- MAGIC     _cli_runner_run_cli_command,
+-- MAGIC     _cli_runner_run_cli_command_with_token,
+-- MAGIC   )
+-- MAGIC None
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC def _cli_runner_get_venv_path_from_databricks_yml(cwd):
+-- MAGIC   import yaml
+-- MAGIC
+-- MAGIC   databricks_yml_path = f"{cwd}/databricks.yml"
+-- MAGIC   with open(databricks_yml_path, "r") as f:
+-- MAGIC     data = yaml.safe_load(f)
+-- MAGIC     return data.get("python", {}).get("venv_path", ".venv")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_run_cli_command(cli_command, cwd, tmp_file_path, include_stderr, env, *, cli_upstream):
+-- MAGIC   import os
+-- MAGIC   import subprocess
+-- MAGIC
+-- MAGIC   stderr_arg = subprocess.PIPE if include_stderr else None
+-- MAGIC   if tmp_file_path:
+-- MAGIC     os.makedirs(os.path.dirname(tmp_file_path), exist_ok=True)
+-- MAGIC     result = subprocess.run(cli_command, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr_arg, text=True, env=env)
+-- MAGIC     with open(tmp_file_path, 'w') as output_file:
+-- MAGIC         output_file.write(result.stdout)
+-- MAGIC         print(result.stdout)
+-- MAGIC   else:
+-- MAGIC     result = subprocess.run(cli_command, cwd=cwd, stderr=stderr_arg, text=True, env=env)
+-- MAGIC   if result.returncode != 0:
+-- MAGIC     error_msg = f"Command {result.args[:3]} failed with exit code {result.returncode}"
+-- MAGIC     if include_stderr and result.stderr:
+-- MAGIC       error_msg += f":\n{result.stderr}"
+-- MAGIC     raise RuntimeError(error_msg)
+-- MAGIC
+-- MAGIC   if cli_upstream == "genie-code":
+-- MAGIC     print(result.stderr)
+-- MAGIC
+-- MAGIC     try:
+-- MAGIC       with open("/Workspace/.proc/self/status", "r") as status_file:
+-- MAGIC         status_file.read()
+-- MAGIC     except Exception as e:
+-- MAGIC       print(f"Warning: Failed to read /Workspace/.proc/self/status: {e}")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_run_cli_command_with_token(cli_command, cwd, tmp_file_path, include_stderr, token, env, *, cli_upstream):
+-- MAGIC   _cli_runner_run_cli_command(
+-- MAGIC     cli_command,
+-- MAGIC     cwd,
+-- MAGIC     tmp_file_path,
+-- MAGIC     include_stderr,
+-- MAGIC     {**env, "DATABRICKS_TOKEN": token},
+-- MAGIC     cli_upstream=cli_upstream,
+-- MAGIC   )
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_get_download_url(workspace_url, token, file_api_path, runner_download_error_marker):
+-- MAGIC   import requests
+-- MAGIC   import time
+-- MAGIC
+-- MAGIC   api_create_download_url = f"{workspace_url}/api/2.0/fs/create-download-url"
+-- MAGIC   headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+-- MAGIC   data = {"path": file_api_path}
+-- MAGIC
+-- MAGIC   max_attempts = 3
+-- MAGIC   last_error = None
+-- MAGIC   for attempt in range(max_attempts):
+-- MAGIC     try:
+-- MAGIC       response = requests.post(api_create_download_url, headers=headers, json=data)
+-- MAGIC       if response.status_code == 200:
+-- MAGIC         return response.json()["url"]
+-- MAGIC       last_error = f"HTTP {response.status_code} {response.text}"
+-- MAGIC     except requests.RequestException as e:
+-- MAGIC       last_error = str(e)
+-- MAGIC     if attempt < max_attempts - 1:
+-- MAGIC       time.sleep(2 ** attempt)
+-- MAGIC
+-- MAGIC   print(f"{runner_download_error_marker}: {file_api_path} {last_error}")
+-- MAGIC   raise RuntimeError(f"Failed to download {file_api_path}: {last_error}")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _databricks_cli_runner():
+-- MAGIC   import hashlib
+-- MAGIC   import os
+-- MAGIC   import platform
+-- MAGIC   import requests
+-- MAGIC   import shlex
+-- MAGIC   import shutil
+-- MAGIC   import subprocess
+-- MAGIC   import tempfile
+-- MAGIC   import time
+-- MAGIC   import zipfile
+-- MAGIC   from dbruntime.databricks_repl_context import get_context
+-- MAGIC   from urllib.parse import urlparse
+-- MAGIC
+-- MAGIC   cli_version = "1.20.0"
+-- MAGIC   terraform_version = ""
+-- MAGIC   provider_version = ""
+-- MAGIC   cwd = ""
+-- MAGIC   args = "apps get simple-customer-api --output JSON"
+-- MAGIC   tmp_file = ""
+-- MAGIC   dev_cli_snippet = ""
+-- MAGIC   artifact_download_error_prefix = "DABsRunnerError: Failed to download CLI dependency"
+-- MAGIC   runner_download_error_marker = "DabsRunnerErrorFallback: Downloading error, using fallback URL"
+-- MAGIC   allow_python_execution = "false"
+-- MAGIC   enable_yaml_sync = "true"
+-- MAGIC   include_stderr_in_error = "true"
+-- MAGIC   cli_upstream = "genie-code"
+-- MAGIC   enforce_serverless = "true"
+-- MAGIC   use_context_api_url = "false"
+-- MAGIC
+-- MAGIC   if enforce_serverless == "true" and os.environ.get("IS_SERVERLESS", "").strip().lower() != "true":
+-- MAGIC     raise RuntimeError("Databricks CLI runner must run on serverless compute")
+-- MAGIC
+-- MAGIC   setup_runner_environment_start = time.monotonic()
+-- MAGIC   ctx = get_context()
+-- MAGIC   token = ctx.apiToken
+-- MAGIC   if use_context_api_url == "true":
+-- MAGIC     workspace_url = f"https://{urlparse(ctx.apiUrl).netloc}"
+-- MAGIC   else:
+-- MAGIC     workspace_url = f"https://{spark.conf.get('spark.databricks.workspaceUrl')}"
+-- MAGIC   cpu_arch = "linux_arm64" if platform.machine() == "aarch64" else "linux_amd64"
+-- MAGIC
+-- MAGIC   env = os.environ.copy()
+-- MAGIC
+-- MAGIC   def emit_event(phase, start_time):
+-- MAGIC     print(f"\n__RUNNER_PHASE__:{phase}:{(time.monotonic() - start_time) * 1000:.0f}", flush=True)
+-- MAGIC
+-- MAGIC   def get_download_url(file_api_path):
+-- MAGIC     return _cli_runner_get_download_url(
+-- MAGIC       workspace_url, token, file_api_path, runner_download_error_marker
+-- MAGIC     )
+-- MAGIC
+-- MAGIC   def download_and_extract(file_url, dest_dir):
+-- MAGIC     response = requests.get(file_url)
+-- MAGIC     if response.status_code != 200:
+-- MAGIC       raise RuntimeError(f"HTTP {response.status_code} while downloading artifact: {response.text}")
+-- MAGIC     tmp_file = f"{dest_dir}.zip"
+-- MAGIC
+-- MAGIC     with open(tmp_file, "wb") as zip_file:
+-- MAGIC         zip_file.write(response.content)
+-- MAGIC     with zipfile.ZipFile(tmp_file, 'r') as zip_ref:
+-- MAGIC         zip_ref.extractall(dest_dir)
+-- MAGIC
+-- MAGIC   def download_artifact_if_not_exists(input_file_name, binary_name, dest_path, tmp_dir):
+-- MAGIC     if os.path.exists(dest_path):
+-- MAGIC       return
+-- MAGIC
+-- MAGIC     try:
+-- MAGIC       os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+-- MAGIC
+-- MAGIC       path_prefix = f"/DatabricksInternal/Jobs/ArtifactRepository/public/databricks-cli-binaries/{cli_version}"
+-- MAGIC       download_url = get_download_url(f"{path_prefix}/{input_file_name}.zip")
+-- MAGIC
+-- MAGIC       tmp_archive_dir = f"{tmp_dir}/{input_file_name}"
+-- MAGIC       download_and_extract(download_url, tmp_archive_dir)
+-- MAGIC
+-- MAGIC       src_path = f"{tmp_archive_dir}/{binary_name}"
+-- MAGIC       if not os.path.exists(src_path):
+-- MAGIC         available = ", ".join(os.listdir(tmp_archive_dir)) if os.path.isdir(tmp_archive_dir) else "(missing archive directory)"
+-- MAGIC         raise RuntimeError(f"Expected binary '{binary_name}' not found in archive contents: {available}")
+-- MAGIC
+-- MAGIC       shutil.move(src_path, dest_path)
+-- MAGIC       os.chmod(dest_path, 0o755)
+-- MAGIC     except Exception as e:
+-- MAGIC       versions_info = f"CLI v{cli_version}, TF v{terraform_version}, TF provider v{provider_version}" if terraform_version else f"CLI v{cli_version}"
+-- MAGIC       error_msg = f"{artifact_download_error_prefix} {input_file_name}/{binary_name} {versions_info}: {str(e)}"
+-- MAGIC       raise RuntimeError(f"{error_msg}")
+-- MAGIC
+-- MAGIC   tmp_base = os.path.expanduser("~/tmp")
+-- MAGIC   if not os.path.exists(tmp_base):
+-- MAGIC     os.makedirs(tmp_base)
+-- MAGIC   os.chmod(tmp_base, 0o700)
+-- MAGIC
+-- MAGIC   with tempfile.TemporaryDirectory(dir=tmp_base) as tmpdirname:
+-- MAGIC       emit_event("setup_runner_environment", setup_runner_environment_start)
+-- MAGIC
+-- MAGIC       download_artifacts_start = time.monotonic()
+-- MAGIC       cli_exec_path = f"{tmp_base}/databricks_{cli_version}_{cpu_arch}"
+-- MAGIC       download_artifact_if_not_exists(
+-- MAGIC         f"databricks_cli_{cpu_arch}",
+-- MAGIC         "databricks",
+-- MAGIC         cli_exec_path,
+-- MAGIC         tmpdirname
+-- MAGIC       )
+-- MAGIC
+-- MAGIC       if terraform_version:
+-- MAGIC         terraform_base = f"{tmp_base}/terraform"
+-- MAGIC         terraform_exec_path = f"{terraform_base}/terraform_{terraform_version}_{cpu_arch}"
+-- MAGIC         download_artifact_if_not_exists(
+-- MAGIC           f"terraform_{cpu_arch}",
+-- MAGIC           "terraform",
+-- MAGIC           terraform_exec_path,
+-- MAGIC           tmpdirname
+-- MAGIC         )
+-- MAGIC
+-- MAGIC         provider_mirror_base = f"{terraform_base}/providers"
+-- MAGIC         provider_mirror_dir = f"{provider_mirror_base}/registry.terraform.io/databricks/databricks/{provider_version}/{cpu_arch}"
+-- MAGIC         os.makedirs(provider_mirror_dir, exist_ok=True)
+-- MAGIC         provider_exec_path = f"{provider_mirror_dir}/terraform-provider-databricks_v{provider_version}"
+-- MAGIC         download_artifact_if_not_exists(
+-- MAGIC           f"terraform_provider_{cpu_arch}",
+-- MAGIC           f"terraform-provider-databricks_v{provider_version}",
+-- MAGIC           provider_exec_path,
+-- MAGIC           tmpdirname
+-- MAGIC         )
+-- MAGIC       emit_event("download_artifacts", download_artifacts_start)
+-- MAGIC
+-- MAGIC       setup_cli_environment_start = time.monotonic()
+-- MAGIC       if terraform_version:
+-- MAGIC         terraform_cli_config_path = f"{terraform_base}/terraform-cli-config"
+-- MAGIC         if not os.path.exists(terraform_cli_config_path):
+-- MAGIC           terraform_cli_config = f'''provider_installation {{
+-- MAGIC   filesystem_mirror {{
+-- MAGIC     path    = "{provider_mirror_base}"
+-- MAGIC     include = ["registry.terraform.io/databricks/databricks"]
+-- MAGIC   }}
+-- MAGIC   direct {{
+-- MAGIC     exclude = ["registry.terraform.io/databricks/databricks"]
+-- MAGIC   }}
+-- MAGIC }}
+-- MAGIC disable_checkpoint = true
+-- MAGIC disable_checkpoint_signature = true
+-- MAGIC '''
+-- MAGIC
+-- MAGIC           with open(terraform_cli_config_path, 'w') as f:
+-- MAGIC             f.write(terraform_cli_config)
+-- MAGIC
+-- MAGIC         env["DATABRICKS_TF_VERSION"] = terraform_version
+-- MAGIC         env["DATABRICKS_TF_EXEC_PATH"] = terraform_exec_path
+-- MAGIC         env["DATABRICKS_TF_PROVIDER_VERSION"] = provider_version
+-- MAGIC         env["DATABRICKS_TF_CLI_CONFIG_FILE"] = terraform_cli_config_path
+-- MAGIC         env["TF_CLI_CONFIG_FILE"] = terraform_cli_config_path
+-- MAGIC
+-- MAGIC       cwd = os.path.normpath(f"/Workspace{cwd}")
+-- MAGIC
+-- MAGIC       if dev_cli_snippet:
+-- MAGIC         cli_path = cli_exec_path
+-- MAGIC         exec(dev_cli_snippet, globals(), locals())
+-- MAGIC
+-- MAGIC       env["DATABRICKS_BUNDLE_TMP"] = f"{tmp_base}/bundle-2-{hashlib.sha256(cwd.encode()).hexdigest()}"
+-- MAGIC       env["DATABRICKS_CLI_UPSTREAM"] = cli_upstream
+-- MAGIC
+-- MAGIC       if enable_yaml_sync == "true":
+-- MAGIC         env["DATABRICKS_BUNDLE_ENABLE_EXPERIMENTAL_YAML_SYNC"] = "1"
+-- MAGIC       else:
+-- MAGIC         env.pop("DATABRICKS_BUNDLE_ENABLE_EXPERIMENTAL_YAML_SYNC", None)
+-- MAGIC
+-- MAGIC       env["DATABRICKS_BUNDLE_ENGINE"] = "direct"
+-- MAGIC
+-- MAGIC       emit_event("setup_cli_environment", setup_cli_environment_start)
+-- MAGIC
+-- MAGIC       if allow_python_execution == "true":
+-- MAGIC         install_dependencies_start = time.monotonic()
+-- MAGIC         venv_path = _cli_runner_get_venv_path_from_databricks_yml(cwd)
+-- MAGIC         venv_folder_path = os.path.normpath(f"{cwd}/{venv_path}")
+-- MAGIC         venv_bin_path = f"{venv_folder_path}/bin"
+-- MAGIC
+-- MAGIC         os.makedirs(venv_bin_path, exist_ok=True)
+-- MAGIC
+-- MAGIC         python3_wrapper_path = f"{venv_bin_path}/python3"
+-- MAGIC         if not os.path.exists(python3_wrapper_path):
+-- MAGIC           with open(python3_wrapper_path, "w") as f:
+-- MAGIC             f.write('#!/usr/bin/env bash\nexec python3 "$@"\n')
+-- MAGIC           os.chmod(python3_wrapper_path, 0o755)
+-- MAGIC
+-- MAGIC         pyvenv_cfg_path = f"{venv_folder_path}/pyvenv.cfg"
+-- MAGIC         if not os.path.exists(pyvenv_cfg_path):
+-- MAGIC           with open(pyvenv_cfg_path, "w") as f:
+-- MAGIC             pass
+-- MAGIC
+-- MAGIC         pyproject_path = f"{cwd}/pyproject.toml"
+-- MAGIC         uv_pip_install_args = ["uv", "pip", "install", "--quiet", "--python", python3_wrapper_path, "--link-mode=copy"]
+-- MAGIC
+-- MAGIC         override_file = None
+-- MAGIC         if os.path.exists(pyproject_path):
+-- MAGIC           uv_pip_install_args.extend(["-r", pyproject_path, "--group", "dev"])
+-- MAGIC         else:
+-- MAGIC           uv_pip_install_args.append(f"databricks-bundles=={cli_version}")
+-- MAGIC
+-- MAGIC         try:
+-- MAGIC           subprocess.run(uv_pip_install_args, check=True, cwd=cwd, stdout=subprocess.DEVNULL, env=env)
+-- MAGIC         finally:
+-- MAGIC           if override_file and os.path.exists(override_file):
+-- MAGIC             os.remove(override_file)
+-- MAGIC         emit_event("install_dependencies", install_dependencies_start)
+-- MAGIC
+-- MAGIC         env.pop("DATABRICKS_BUNDLE_RESTRICTED_CODE_EXECUTION", None)
+-- MAGIC       else:
+-- MAGIC         env["DATABRICKS_BUNDLE_RESTRICTED_CODE_EXECUTION"] = "1"
+-- MAGIC
+-- MAGIC       env.pop("DATABRICKS_CLUSTER_ID", None)
+-- MAGIC
+-- MAGIC       with tempfile.NamedTemporaryFile(mode='w+', dir=tmpdirname, delete=True) as databrickscfg_file:
+-- MAGIC           profile_name = "workspace_profile"
+-- MAGIC           databrickscfg_file.write(f"[workspace_profile]\nhost = {workspace_url}")
+-- MAGIC           databrickscfg_file.flush()
+-- MAGIC           env["DATABRICKS_CONFIG_FILE"] = databrickscfg_file.name
+-- MAGIC
+-- MAGIC           cli_command = [cli_exec_path] + shlex.split(args) + ["-p", profile_name]
+-- MAGIC           tmp_file_path = tmp_file
+-- MAGIC
+-- MAGIC           run_cli_start = time.monotonic()
+-- MAGIC           run_cli_phase = "run_cli_genie" if cli_upstream == "genie-code" else "run_cli"
+-- MAGIC           try:
+-- MAGIC             _cli_runner_run_cli_command_with_token(
+-- MAGIC               cli_command,
+-- MAGIC               cwd,
+-- MAGIC               tmp_file_path,
+-- MAGIC               include_stderr_in_error == "true",
+-- MAGIC               token,
+-- MAGIC               env,
+-- MAGIC               cli_upstream=cli_upstream,
+-- MAGIC             )
+-- MAGIC           finally:
+-- MAGIC             emit_event(run_cli_phase, run_cli_start)
+-- MAGIC
+-- MAGIC
+-- MAGIC try:
+-- MAGIC   _databricks_cli_runner()
+-- MAGIC finally:
+-- MAGIC   del (
+-- MAGIC     _databricks_cli_runner,
+-- MAGIC     _cli_runner_get_venv_path_from_databricks_yml,
+-- MAGIC     _cli_runner_get_download_url,
+-- MAGIC     _cli_runner_run_cli_command,
+-- MAGIC     _cli_runner_run_cli_command_with_token,
+-- MAGIC   )
+-- MAGIC None
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC def _cli_runner_get_venv_path_from_databricks_yml(cwd):
+-- MAGIC   import yaml
+-- MAGIC
+-- MAGIC   databricks_yml_path = f"{cwd}/databricks.yml"
+-- MAGIC   with open(databricks_yml_path, "r") as f:
+-- MAGIC     data = yaml.safe_load(f)
+-- MAGIC     return data.get("python", {}).get("venv_path", ".venv")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_run_cli_command(cli_command, cwd, tmp_file_path, include_stderr, env, *, cli_upstream):
+-- MAGIC   import os
+-- MAGIC   import subprocess
+-- MAGIC
+-- MAGIC   stderr_arg = subprocess.PIPE if include_stderr else None
+-- MAGIC   if tmp_file_path:
+-- MAGIC     os.makedirs(os.path.dirname(tmp_file_path), exist_ok=True)
+-- MAGIC     result = subprocess.run(cli_command, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr_arg, text=True, env=env)
+-- MAGIC     with open(tmp_file_path, 'w') as output_file:
+-- MAGIC         output_file.write(result.stdout)
+-- MAGIC         print(result.stdout)
+-- MAGIC   else:
+-- MAGIC     result = subprocess.run(cli_command, cwd=cwd, stderr=stderr_arg, text=True, env=env)
+-- MAGIC   if result.returncode != 0:
+-- MAGIC     error_msg = f"Command {result.args[:3]} failed with exit code {result.returncode}"
+-- MAGIC     if include_stderr and result.stderr:
+-- MAGIC       error_msg += f":\n{result.stderr}"
+-- MAGIC     raise RuntimeError(error_msg)
+-- MAGIC
+-- MAGIC   if cli_upstream == "genie-code":
+-- MAGIC     print(result.stderr)
+-- MAGIC
+-- MAGIC     try:
+-- MAGIC       with open("/Workspace/.proc/self/status", "r") as status_file:
+-- MAGIC         status_file.read()
+-- MAGIC     except Exception as e:
+-- MAGIC       print(f"Warning: Failed to read /Workspace/.proc/self/status: {e}")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_run_cli_command_with_token(cli_command, cwd, tmp_file_path, include_stderr, token, env, *, cli_upstream):
+-- MAGIC   _cli_runner_run_cli_command(
+-- MAGIC     cli_command,
+-- MAGIC     cwd,
+-- MAGIC     tmp_file_path,
+-- MAGIC     include_stderr,
+-- MAGIC     {**env, "DATABRICKS_TOKEN": token},
+-- MAGIC     cli_upstream=cli_upstream,
+-- MAGIC   )
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_get_download_url(workspace_url, token, file_api_path, runner_download_error_marker):
+-- MAGIC   import requests
+-- MAGIC   import time
+-- MAGIC
+-- MAGIC   api_create_download_url = f"{workspace_url}/api/2.0/fs/create-download-url"
+-- MAGIC   headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+-- MAGIC   data = {"path": file_api_path}
+-- MAGIC
+-- MAGIC   max_attempts = 3
+-- MAGIC   last_error = None
+-- MAGIC   for attempt in range(max_attempts):
+-- MAGIC     try:
+-- MAGIC       response = requests.post(api_create_download_url, headers=headers, json=data)
+-- MAGIC       if response.status_code == 200:
+-- MAGIC         return response.json()["url"]
+-- MAGIC       last_error = f"HTTP {response.status_code} {response.text}"
+-- MAGIC     except requests.RequestException as e:
+-- MAGIC       last_error = str(e)
+-- MAGIC     if attempt < max_attempts - 1:
+-- MAGIC       time.sleep(2 ** attempt)
+-- MAGIC
+-- MAGIC   print(f"{runner_download_error_marker}: {file_api_path} {last_error}")
+-- MAGIC   raise RuntimeError(f"Failed to download {file_api_path}: {last_error}")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _databricks_cli_runner():
+-- MAGIC   import hashlib
+-- MAGIC   import os
+-- MAGIC   import platform
+-- MAGIC   import requests
+-- MAGIC   import shlex
+-- MAGIC   import shutil
+-- MAGIC   import subprocess
+-- MAGIC   import tempfile
+-- MAGIC   import time
+-- MAGIC   import zipfile
+-- MAGIC   from dbruntime.databricks_repl_context import get_context
+-- MAGIC   from urllib.parse import urlparse
+-- MAGIC
+-- MAGIC   cli_version = "1.20.0"
+-- MAGIC   terraform_version = ""
+-- MAGIC   provider_version = ""
+-- MAGIC   cwd = ""
+-- MAGIC   args = "apps get simple-customer-api --output JSON"
+-- MAGIC   tmp_file = ""
+-- MAGIC   dev_cli_snippet = ""
+-- MAGIC   artifact_download_error_prefix = "DABsRunnerError: Failed to download CLI dependency"
+-- MAGIC   runner_download_error_marker = "DabsRunnerErrorFallback: Downloading error, using fallback URL"
+-- MAGIC   allow_python_execution = "false"
+-- MAGIC   enable_yaml_sync = "true"
+-- MAGIC   include_stderr_in_error = "true"
+-- MAGIC   cli_upstream = "genie-code"
+-- MAGIC   enforce_serverless = "true"
+-- MAGIC   use_context_api_url = "false"
+-- MAGIC
+-- MAGIC   if enforce_serverless == "true" and os.environ.get("IS_SERVERLESS", "").strip().lower() != "true":
+-- MAGIC     raise RuntimeError("Databricks CLI runner must run on serverless compute")
+-- MAGIC
+-- MAGIC   setup_runner_environment_start = time.monotonic()
+-- MAGIC   ctx = get_context()
+-- MAGIC   token = ctx.apiToken
+-- MAGIC   if use_context_api_url == "true":
+-- MAGIC     workspace_url = f"https://{urlparse(ctx.apiUrl).netloc}"
+-- MAGIC   else:
+-- MAGIC     workspace_url = f"https://{spark.conf.get('spark.databricks.workspaceUrl')}"
+-- MAGIC   cpu_arch = "linux_arm64" if platform.machine() == "aarch64" else "linux_amd64"
+-- MAGIC
+-- MAGIC   env = os.environ.copy()
+-- MAGIC
+-- MAGIC   def emit_event(phase, start_time):
+-- MAGIC     print(f"\n__RUNNER_PHASE__:{phase}:{(time.monotonic() - start_time) * 1000:.0f}", flush=True)
+-- MAGIC
+-- MAGIC   def get_download_url(file_api_path):
+-- MAGIC     return _cli_runner_get_download_url(
+-- MAGIC       workspace_url, token, file_api_path, runner_download_error_marker
+-- MAGIC     )
+-- MAGIC
+-- MAGIC   def download_and_extract(file_url, dest_dir):
+-- MAGIC     response = requests.get(file_url)
+-- MAGIC     if response.status_code != 200:
+-- MAGIC       raise RuntimeError(f"HTTP {response.status_code} while downloading artifact: {response.text}")
+-- MAGIC     tmp_file = f"{dest_dir}.zip"
+-- MAGIC
+-- MAGIC     with open(tmp_file, "wb") as zip_file:
+-- MAGIC         zip_file.write(response.content)
+-- MAGIC     with zipfile.ZipFile(tmp_file, 'r') as zip_ref:
+-- MAGIC         zip_ref.extractall(dest_dir)
+-- MAGIC
+-- MAGIC   def download_artifact_if_not_exists(input_file_name, binary_name, dest_path, tmp_dir):
+-- MAGIC     if os.path.exists(dest_path):
+-- MAGIC       return
+-- MAGIC
+-- MAGIC     try:
+-- MAGIC       os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+-- MAGIC
+-- MAGIC       path_prefix = f"/DatabricksInternal/Jobs/ArtifactRepository/public/databricks-cli-binaries/{cli_version}"
+-- MAGIC       download_url = get_download_url(f"{path_prefix}/{input_file_name}.zip")
+-- MAGIC
+-- MAGIC       tmp_archive_dir = f"{tmp_dir}/{input_file_name}"
+-- MAGIC       download_and_extract(download_url, tmp_archive_dir)
+-- MAGIC
+-- MAGIC       src_path = f"{tmp_archive_dir}/{binary_name}"
+-- MAGIC       if not os.path.exists(src_path):
+-- MAGIC         available = ", ".join(os.listdir(tmp_archive_dir)) if os.path.isdir(tmp_archive_dir) else "(missing archive directory)"
+-- MAGIC         raise RuntimeError(f"Expected binary '{binary_name}' not found in archive contents: {available}")
+-- MAGIC
+-- MAGIC       shutil.move(src_path, dest_path)
+-- MAGIC       os.chmod(dest_path, 0o755)
+-- MAGIC     except Exception as e:
+-- MAGIC       versions_info = f"CLI v{cli_version}, TF v{terraform_version}, TF provider v{provider_version}" if terraform_version else f"CLI v{cli_version}"
+-- MAGIC       error_msg = f"{artifact_download_error_prefix} {input_file_name}/{binary_name} {versions_info}: {str(e)}"
+-- MAGIC       raise RuntimeError(f"{error_msg}")
+-- MAGIC
+-- MAGIC   tmp_base = os.path.expanduser("~/tmp")
+-- MAGIC   if not os.path.exists(tmp_base):
+-- MAGIC     os.makedirs(tmp_base)
+-- MAGIC   os.chmod(tmp_base, 0o700)
+-- MAGIC
+-- MAGIC   with tempfile.TemporaryDirectory(dir=tmp_base) as tmpdirname:
+-- MAGIC       emit_event("setup_runner_environment", setup_runner_environment_start)
+-- MAGIC
+-- MAGIC       download_artifacts_start = time.monotonic()
+-- MAGIC       cli_exec_path = f"{tmp_base}/databricks_{cli_version}_{cpu_arch}"
+-- MAGIC       download_artifact_if_not_exists(
+-- MAGIC         f"databricks_cli_{cpu_arch}",
+-- MAGIC         "databricks",
+-- MAGIC         cli_exec_path,
+-- MAGIC         tmpdirname
+-- MAGIC       )
+-- MAGIC
+-- MAGIC       if terraform_version:
+-- MAGIC         terraform_base = f"{tmp_base}/terraform"
+-- MAGIC         terraform_exec_path = f"{terraform_base}/terraform_{terraform_version}_{cpu_arch}"
+-- MAGIC         download_artifact_if_not_exists(
+-- MAGIC           f"terraform_{cpu_arch}",
+-- MAGIC           "terraform",
+-- MAGIC           terraform_exec_path,
+-- MAGIC           tmpdirname
+-- MAGIC         )
+-- MAGIC
+-- MAGIC         provider_mirror_base = f"{terraform_base}/providers"
+-- MAGIC         provider_mirror_dir = f"{provider_mirror_base}/registry.terraform.io/databricks/databricks/{provider_version}/{cpu_arch}"
+-- MAGIC         os.makedirs(provider_mirror_dir, exist_ok=True)
+-- MAGIC         provider_exec_path = f"{provider_mirror_dir}/terraform-provider-databricks_v{provider_version}"
+-- MAGIC         download_artifact_if_not_exists(
+-- MAGIC           f"terraform_provider_{cpu_arch}",
+-- MAGIC           f"terraform-provider-databricks_v{provider_version}",
+-- MAGIC           provider_exec_path,
+-- MAGIC           tmpdirname
+-- MAGIC         )
+-- MAGIC       emit_event("download_artifacts", download_artifacts_start)
+-- MAGIC
+-- MAGIC       setup_cli_environment_start = time.monotonic()
+-- MAGIC       if terraform_version:
+-- MAGIC         terraform_cli_config_path = f"{terraform_base}/terraform-cli-config"
+-- MAGIC         if not os.path.exists(terraform_cli_config_path):
+-- MAGIC           terraform_cli_config = f'''provider_installation {{
+-- MAGIC   filesystem_mirror {{
+-- MAGIC     path    = "{provider_mirror_base}"
+-- MAGIC     include = ["registry.terraform.io/databricks/databricks"]
+-- MAGIC   }}
+-- MAGIC   direct {{
+-- MAGIC     exclude = ["registry.terraform.io/databricks/databricks"]
+-- MAGIC   }}
+-- MAGIC }}
+-- MAGIC disable_checkpoint = true
+-- MAGIC disable_checkpoint_signature = true
+-- MAGIC '''
+-- MAGIC
+-- MAGIC           with open(terraform_cli_config_path, 'w') as f:
+-- MAGIC             f.write(terraform_cli_config)
+-- MAGIC
+-- MAGIC         env["DATABRICKS_TF_VERSION"] = terraform_version
+-- MAGIC         env["DATABRICKS_TF_EXEC_PATH"] = terraform_exec_path
+-- MAGIC         env["DATABRICKS_TF_PROVIDER_VERSION"] = provider_version
+-- MAGIC         env["DATABRICKS_TF_CLI_CONFIG_FILE"] = terraform_cli_config_path
+-- MAGIC         env["TF_CLI_CONFIG_FILE"] = terraform_cli_config_path
+-- MAGIC
+-- MAGIC       cwd = os.path.normpath(f"/Workspace{cwd}")
+-- MAGIC
+-- MAGIC       if dev_cli_snippet:
+-- MAGIC         cli_path = cli_exec_path
+-- MAGIC         exec(dev_cli_snippet, globals(), locals())
+-- MAGIC
+-- MAGIC       env["DATABRICKS_BUNDLE_TMP"] = f"{tmp_base}/bundle-2-{hashlib.sha256(cwd.encode()).hexdigest()}"
+-- MAGIC       env["DATABRICKS_CLI_UPSTREAM"] = cli_upstream
+-- MAGIC
+-- MAGIC       if enable_yaml_sync == "true":
+-- MAGIC         env["DATABRICKS_BUNDLE_ENABLE_EXPERIMENTAL_YAML_SYNC"] = "1"
+-- MAGIC       else:
+-- MAGIC         env.pop("DATABRICKS_BUNDLE_ENABLE_EXPERIMENTAL_YAML_SYNC", None)
+-- MAGIC
+-- MAGIC       env["DATABRICKS_BUNDLE_ENGINE"] = "direct"
+-- MAGIC
+-- MAGIC       emit_event("setup_cli_environment", setup_cli_environment_start)
+-- MAGIC
+-- MAGIC       if allow_python_execution == "true":
+-- MAGIC         install_dependencies_start = time.monotonic()
+-- MAGIC         venv_path = _cli_runner_get_venv_path_from_databricks_yml(cwd)
+-- MAGIC         venv_folder_path = os.path.normpath(f"{cwd}/{venv_path}")
+-- MAGIC         venv_bin_path = f"{venv_folder_path}/bin"
+-- MAGIC
+-- MAGIC         os.makedirs(venv_bin_path, exist_ok=True)
+-- MAGIC
+-- MAGIC         python3_wrapper_path = f"{venv_bin_path}/python3"
+-- MAGIC         if not os.path.exists(python3_wrapper_path):
+-- MAGIC           with open(python3_wrapper_path, "w") as f:
+-- MAGIC             f.write('#!/usr/bin/env bash\nexec python3 "$@"\n')
+-- MAGIC           os.chmod(python3_wrapper_path, 0o755)
+-- MAGIC
+-- MAGIC         pyvenv_cfg_path = f"{venv_folder_path}/pyvenv.cfg"
+-- MAGIC         if not os.path.exists(pyvenv_cfg_path):
+-- MAGIC           with open(pyvenv_cfg_path, "w") as f:
+-- MAGIC             pass
+-- MAGIC
+-- MAGIC         pyproject_path = f"{cwd}/pyproject.toml"
+-- MAGIC         uv_pip_install_args = ["uv", "pip", "install", "--quiet", "--python", python3_wrapper_path, "--link-mode=copy"]
+-- MAGIC
+-- MAGIC         override_file = None
+-- MAGIC         if os.path.exists(pyproject_path):
+-- MAGIC           uv_pip_install_args.extend(["-r", pyproject_path, "--group", "dev"])
+-- MAGIC         else:
+-- MAGIC           uv_pip_install_args.append(f"databricks-bundles=={cli_version}")
+-- MAGIC
+-- MAGIC         try:
+-- MAGIC           subprocess.run(uv_pip_install_args, check=True, cwd=cwd, stdout=subprocess.DEVNULL, env=env)
+-- MAGIC         finally:
+-- MAGIC           if override_file and os.path.exists(override_file):
+-- MAGIC             os.remove(override_file)
+-- MAGIC         emit_event("install_dependencies", install_dependencies_start)
+-- MAGIC
+-- MAGIC         env.pop("DATABRICKS_BUNDLE_RESTRICTED_CODE_EXECUTION", None)
+-- MAGIC       else:
+-- MAGIC         env["DATABRICKS_BUNDLE_RESTRICTED_CODE_EXECUTION"] = "1"
+-- MAGIC
+-- MAGIC       env.pop("DATABRICKS_CLUSTER_ID", None)
+-- MAGIC
+-- MAGIC       with tempfile.NamedTemporaryFile(mode='w+', dir=tmpdirname, delete=True) as databrickscfg_file:
+-- MAGIC           profile_name = "workspace_profile"
+-- MAGIC           databrickscfg_file.write(f"[workspace_profile]\nhost = {workspace_url}")
+-- MAGIC           databrickscfg_file.flush()
+-- MAGIC           env["DATABRICKS_CONFIG_FILE"] = databrickscfg_file.name
+-- MAGIC
+-- MAGIC           cli_command = [cli_exec_path] + shlex.split(args) + ["-p", profile_name]
+-- MAGIC           tmp_file_path = tmp_file
+-- MAGIC
+-- MAGIC           run_cli_start = time.monotonic()
+-- MAGIC           run_cli_phase = "run_cli_genie" if cli_upstream == "genie-code" else "run_cli"
+-- MAGIC           try:
+-- MAGIC             _cli_runner_run_cli_command_with_token(
+-- MAGIC               cli_command,
+-- MAGIC               cwd,
+-- MAGIC               tmp_file_path,
+-- MAGIC               include_stderr_in_error == "true",
+-- MAGIC               token,
+-- MAGIC               env,
+-- MAGIC               cli_upstream=cli_upstream,
+-- MAGIC             )
+-- MAGIC           finally:
+-- MAGIC             emit_event(run_cli_phase, run_cli_start)
+-- MAGIC
+-- MAGIC
+-- MAGIC try:
+-- MAGIC   _databricks_cli_runner()
+-- MAGIC finally:
+-- MAGIC   del (
+-- MAGIC     _databricks_cli_runner,
+-- MAGIC     _cli_runner_get_venv_path_from_databricks_yml,
+-- MAGIC     _cli_runner_get_download_url,
+-- MAGIC     _cli_runner_run_cli_command,
+-- MAGIC     _cli_runner_run_cli_command_with_token,
+-- MAGIC   )
+-- MAGIC None
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC def _cli_runner_get_venv_path_from_databricks_yml(cwd):
+-- MAGIC   import yaml
+-- MAGIC
+-- MAGIC   databricks_yml_path = f"{cwd}/databricks.yml"
+-- MAGIC   with open(databricks_yml_path, "r") as f:
+-- MAGIC     data = yaml.safe_load(f)
+-- MAGIC     return data.get("python", {}).get("venv_path", ".venv")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_run_cli_command(cli_command, cwd, tmp_file_path, include_stderr, env, *, cli_upstream):
+-- MAGIC   import os
+-- MAGIC   import subprocess
+-- MAGIC
+-- MAGIC   stderr_arg = subprocess.PIPE if include_stderr else None
+-- MAGIC   if tmp_file_path:
+-- MAGIC     os.makedirs(os.path.dirname(tmp_file_path), exist_ok=True)
+-- MAGIC     result = subprocess.run(cli_command, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr_arg, text=True, env=env)
+-- MAGIC     with open(tmp_file_path, 'w') as output_file:
+-- MAGIC         output_file.write(result.stdout)
+-- MAGIC         print(result.stdout)
+-- MAGIC   else:
+-- MAGIC     result = subprocess.run(cli_command, cwd=cwd, stderr=stderr_arg, text=True, env=env)
+-- MAGIC   if result.returncode != 0:
+-- MAGIC     error_msg = f"Command {result.args[:3]} failed with exit code {result.returncode}"
+-- MAGIC     if include_stderr and result.stderr:
+-- MAGIC       error_msg += f":\n{result.stderr}"
+-- MAGIC     raise RuntimeError(error_msg)
+-- MAGIC
+-- MAGIC   if cli_upstream == "genie-code":
+-- MAGIC     print(result.stderr)
+-- MAGIC
+-- MAGIC     try:
+-- MAGIC       with open("/Workspace/.proc/self/status", "r") as status_file:
+-- MAGIC         status_file.read()
+-- MAGIC     except Exception as e:
+-- MAGIC       print(f"Warning: Failed to read /Workspace/.proc/self/status: {e}")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_run_cli_command_with_token(cli_command, cwd, tmp_file_path, include_stderr, token, env, *, cli_upstream):
+-- MAGIC   _cli_runner_run_cli_command(
+-- MAGIC     cli_command,
+-- MAGIC     cwd,
+-- MAGIC     tmp_file_path,
+-- MAGIC     include_stderr,
+-- MAGIC     {**env, "DATABRICKS_TOKEN": token},
+-- MAGIC     cli_upstream=cli_upstream,
+-- MAGIC   )
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_get_download_url(workspace_url, token, file_api_path, runner_download_error_marker):
+-- MAGIC   import requests
+-- MAGIC   import time
+-- MAGIC
+-- MAGIC   api_create_download_url = f"{workspace_url}/api/2.0/fs/create-download-url"
+-- MAGIC   headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+-- MAGIC   data = {"path": file_api_path}
+-- MAGIC
+-- MAGIC   max_attempts = 3
+-- MAGIC   last_error = None
+-- MAGIC   for attempt in range(max_attempts):
+-- MAGIC     try:
+-- MAGIC       response = requests.post(api_create_download_url, headers=headers, json=data)
+-- MAGIC       if response.status_code == 200:
+-- MAGIC         return response.json()["url"]
+-- MAGIC       last_error = f"HTTP {response.status_code} {response.text}"
+-- MAGIC     except requests.RequestException as e:
+-- MAGIC       last_error = str(e)
+-- MAGIC     if attempt < max_attempts - 1:
+-- MAGIC       time.sleep(2 ** attempt)
+-- MAGIC
+-- MAGIC   print(f"{runner_download_error_marker}: {file_api_path} {last_error}")
+-- MAGIC   raise RuntimeError(f"Failed to download {file_api_path}: {last_error}")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _databricks_cli_runner():
+-- MAGIC   import hashlib
+-- MAGIC   import os
+-- MAGIC   import platform
+-- MAGIC   import requests
+-- MAGIC   import shlex
+-- MAGIC   import shutil
+-- MAGIC   import subprocess
+-- MAGIC   import tempfile
+-- MAGIC   import time
+-- MAGIC   import zipfile
+-- MAGIC   from dbruntime.databricks_repl_context import get_context
+-- MAGIC   from urllib.parse import urlparse
+-- MAGIC
+-- MAGIC   cli_version = "1.20.0"
+-- MAGIC   terraform_version = ""
+-- MAGIC   provider_version = ""
+-- MAGIC   cwd = ""
+-- MAGIC   args = "apps get simple-customer-api --output JSON"
+-- MAGIC   tmp_file = ""
+-- MAGIC   dev_cli_snippet = ""
+-- MAGIC   artifact_download_error_prefix = "DABsRunnerError: Failed to download CLI dependency"
+-- MAGIC   runner_download_error_marker = "DabsRunnerErrorFallback: Downloading error, using fallback URL"
+-- MAGIC   allow_python_execution = "false"
+-- MAGIC   enable_yaml_sync = "true"
+-- MAGIC   include_stderr_in_error = "true"
+-- MAGIC   cli_upstream = "genie-code"
+-- MAGIC   enforce_serverless = "true"
+-- MAGIC   use_context_api_url = "false"
+-- MAGIC
+-- MAGIC   if enforce_serverless == "true" and os.environ.get("IS_SERVERLESS", "").strip().lower() != "true":
+-- MAGIC     raise RuntimeError("Databricks CLI runner must run on serverless compute")
+-- MAGIC
+-- MAGIC   setup_runner_environment_start = time.monotonic()
+-- MAGIC   ctx = get_context()
+-- MAGIC   token = ctx.apiToken
+-- MAGIC   if use_context_api_url == "true":
+-- MAGIC     workspace_url = f"https://{urlparse(ctx.apiUrl).netloc}"
+-- MAGIC   else:
+-- MAGIC     workspace_url = f"https://{spark.conf.get('spark.databricks.workspaceUrl')}"
+-- MAGIC   cpu_arch = "linux_arm64" if platform.machine() == "aarch64" else "linux_amd64"
+-- MAGIC
+-- MAGIC   env = os.environ.copy()
+-- MAGIC
+-- MAGIC   def emit_event(phase, start_time):
+-- MAGIC     print(f"\n__RUNNER_PHASE__:{phase}:{(time.monotonic() - start_time) * 1000:.0f}", flush=True)
+-- MAGIC
+-- MAGIC   def get_download_url(file_api_path):
+-- MAGIC     return _cli_runner_get_download_url(
+-- MAGIC       workspace_url, token, file_api_path, runner_download_error_marker
+-- MAGIC     )
+-- MAGIC
+-- MAGIC   def download_and_extract(file_url, dest_dir):
+-- MAGIC     response = requests.get(file_url)
+-- MAGIC     if response.status_code != 200:
+-- MAGIC       raise RuntimeError(f"HTTP {response.status_code} while downloading artifact: {response.text}")
+-- MAGIC     tmp_file = f"{dest_dir}.zip"
+-- MAGIC
+-- MAGIC     with open(tmp_file, "wb") as zip_file:
+-- MAGIC         zip_file.write(response.content)
+-- MAGIC     with zipfile.ZipFile(tmp_file, 'r') as zip_ref:
+-- MAGIC         zip_ref.extractall(dest_dir)
+-- MAGIC
+-- MAGIC   def download_artifact_if_not_exists(input_file_name, binary_name, dest_path, tmp_dir):
+-- MAGIC     if os.path.exists(dest_path):
+-- MAGIC       return
+-- MAGIC
+-- MAGIC     try:
+-- MAGIC       os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+-- MAGIC
+-- MAGIC       path_prefix = f"/DatabricksInternal/Jobs/ArtifactRepository/public/databricks-cli-binaries/{cli_version}"
+-- MAGIC       download_url = get_download_url(f"{path_prefix}/{input_file_name}.zip")
+-- MAGIC
+-- MAGIC       tmp_archive_dir = f"{tmp_dir}/{input_file_name}"
+-- MAGIC       download_and_extract(download_url, tmp_archive_dir)
+-- MAGIC
+-- MAGIC       src_path = f"{tmp_archive_dir}/{binary_name}"
+-- MAGIC       if not os.path.exists(src_path):
+-- MAGIC         available = ", ".join(os.listdir(tmp_archive_dir)) if os.path.isdir(tmp_archive_dir) else "(missing archive directory)"
+-- MAGIC         raise RuntimeError(f"Expected binary '{binary_name}' not found in archive contents: {available}")
+-- MAGIC
+-- MAGIC       shutil.move(src_path, dest_path)
+-- MAGIC       os.chmod(dest_path, 0o755)
+-- MAGIC     except Exception as e:
+-- MAGIC       versions_info = f"CLI v{cli_version}, TF v{terraform_version}, TF provider v{provider_version}" if terraform_version else f"CLI v{cli_version}"
+-- MAGIC       error_msg = f"{artifact_download_error_prefix} {input_file_name}/{binary_name} {versions_info}: {str(e)}"
+-- MAGIC       raise RuntimeError(f"{error_msg}")
+-- MAGIC
+-- MAGIC   tmp_base = os.path.expanduser("~/tmp")
+-- MAGIC   if not os.path.exists(tmp_base):
+-- MAGIC     os.makedirs(tmp_base)
+-- MAGIC   os.chmod(tmp_base, 0o700)
+-- MAGIC
+-- MAGIC   with tempfile.TemporaryDirectory(dir=tmp_base) as tmpdirname:
+-- MAGIC       emit_event("setup_runner_environment", setup_runner_environment_start)
+-- MAGIC
+-- MAGIC       download_artifacts_start = time.monotonic()
+-- MAGIC       cli_exec_path = f"{tmp_base}/databricks_{cli_version}_{cpu_arch}"
+-- MAGIC       download_artifact_if_not_exists(
+-- MAGIC         f"databricks_cli_{cpu_arch}",
+-- MAGIC         "databricks",
+-- MAGIC         cli_exec_path,
+-- MAGIC         tmpdirname
+-- MAGIC       )
+-- MAGIC
+-- MAGIC       if terraform_version:
+-- MAGIC         terraform_base = f"{tmp_base}/terraform"
+-- MAGIC         terraform_exec_path = f"{terraform_base}/terraform_{terraform_version}_{cpu_arch}"
+-- MAGIC         download_artifact_if_not_exists(
+-- MAGIC           f"terraform_{cpu_arch}",
+-- MAGIC           "terraform",
+-- MAGIC           terraform_exec_path,
+-- MAGIC           tmpdirname
+-- MAGIC         )
+-- MAGIC
+-- MAGIC         provider_mirror_base = f"{terraform_base}/providers"
+-- MAGIC         provider_mirror_dir = f"{provider_mirror_base}/registry.terraform.io/databricks/databricks/{provider_version}/{cpu_arch}"
+-- MAGIC         os.makedirs(provider_mirror_dir, exist_ok=True)
+-- MAGIC         provider_exec_path = f"{provider_mirror_dir}/terraform-provider-databricks_v{provider_version}"
+-- MAGIC         download_artifact_if_not_exists(
+-- MAGIC           f"terraform_provider_{cpu_arch}",
+-- MAGIC           f"terraform-provider-databricks_v{provider_version}",
+-- MAGIC           provider_exec_path,
+-- MAGIC           tmpdirname
+-- MAGIC         )
+-- MAGIC       emit_event("download_artifacts", download_artifacts_start)
+-- MAGIC
+-- MAGIC       setup_cli_environment_start = time.monotonic()
+-- MAGIC       if terraform_version:
+-- MAGIC         terraform_cli_config_path = f"{terraform_base}/terraform-cli-config"
+-- MAGIC         if not os.path.exists(terraform_cli_config_path):
+-- MAGIC           terraform_cli_config = f'''provider_installation {{
+-- MAGIC   filesystem_mirror {{
+-- MAGIC     path    = "{provider_mirror_base}"
+-- MAGIC     include = ["registry.terraform.io/databricks/databricks"]
+-- MAGIC   }}
+-- MAGIC   direct {{
+-- MAGIC     exclude = ["registry.terraform.io/databricks/databricks"]
+-- MAGIC   }}
+-- MAGIC }}
+-- MAGIC disable_checkpoint = true
+-- MAGIC disable_checkpoint_signature = true
+-- MAGIC '''
+-- MAGIC
+-- MAGIC           with open(terraform_cli_config_path, 'w') as f:
+-- MAGIC             f.write(terraform_cli_config)
+-- MAGIC
+-- MAGIC         env["DATABRICKS_TF_VERSION"] = terraform_version
+-- MAGIC         env["DATABRICKS_TF_EXEC_PATH"] = terraform_exec_path
+-- MAGIC         env["DATABRICKS_TF_PROVIDER_VERSION"] = provider_version
+-- MAGIC         env["DATABRICKS_TF_CLI_CONFIG_FILE"] = terraform_cli_config_path
+-- MAGIC         env["TF_CLI_CONFIG_FILE"] = terraform_cli_config_path
+-- MAGIC
+-- MAGIC       cwd = os.path.normpath(f"/Workspace{cwd}")
+-- MAGIC
+-- MAGIC       if dev_cli_snippet:
+-- MAGIC         cli_path = cli_exec_path
+-- MAGIC         exec(dev_cli_snippet, globals(), locals())
+-- MAGIC
+-- MAGIC       env["DATABRICKS_BUNDLE_TMP"] = f"{tmp_base}/bundle-2-{hashlib.sha256(cwd.encode()).hexdigest()}"
+-- MAGIC       env["DATABRICKS_CLI_UPSTREAM"] = cli_upstream
+-- MAGIC
+-- MAGIC       if enable_yaml_sync == "true":
+-- MAGIC         env["DATABRICKS_BUNDLE_ENABLE_EXPERIMENTAL_YAML_SYNC"] = "1"
+-- MAGIC       else:
+-- MAGIC         env.pop("DATABRICKS_BUNDLE_ENABLE_EXPERIMENTAL_YAML_SYNC", None)
+-- MAGIC
+-- MAGIC       env["DATABRICKS_BUNDLE_ENGINE"] = "direct"
+-- MAGIC
+-- MAGIC       emit_event("setup_cli_environment", setup_cli_environment_start)
+-- MAGIC
+-- MAGIC       if allow_python_execution == "true":
+-- MAGIC         install_dependencies_start = time.monotonic()
+-- MAGIC         venv_path = _cli_runner_get_venv_path_from_databricks_yml(cwd)
+-- MAGIC         venv_folder_path = os.path.normpath(f"{cwd}/{venv_path}")
+-- MAGIC         venv_bin_path = f"{venv_folder_path}/bin"
+-- MAGIC
+-- MAGIC         os.makedirs(venv_bin_path, exist_ok=True)
+-- MAGIC
+-- MAGIC         python3_wrapper_path = f"{venv_bin_path}/python3"
+-- MAGIC         if not os.path.exists(python3_wrapper_path):
+-- MAGIC           with open(python3_wrapper_path, "w") as f:
+-- MAGIC             f.write('#!/usr/bin/env bash\nexec python3 "$@"\n')
+-- MAGIC           os.chmod(python3_wrapper_path, 0o755)
+-- MAGIC
+-- MAGIC         pyvenv_cfg_path = f"{venv_folder_path}/pyvenv.cfg"
+-- MAGIC         if not os.path.exists(pyvenv_cfg_path):
+-- MAGIC           with open(pyvenv_cfg_path, "w") as f:
+-- MAGIC             pass
+-- MAGIC
+-- MAGIC         pyproject_path = f"{cwd}/pyproject.toml"
+-- MAGIC         uv_pip_install_args = ["uv", "pip", "install", "--quiet", "--python", python3_wrapper_path, "--link-mode=copy"]
+-- MAGIC
+-- MAGIC         override_file = None
+-- MAGIC         if os.path.exists(pyproject_path):
+-- MAGIC           uv_pip_install_args.extend(["-r", pyproject_path, "--group", "dev"])
+-- MAGIC         else:
+-- MAGIC           uv_pip_install_args.append(f"databricks-bundles=={cli_version}")
+-- MAGIC
+-- MAGIC         try:
+-- MAGIC           subprocess.run(uv_pip_install_args, check=True, cwd=cwd, stdout=subprocess.DEVNULL, env=env)
+-- MAGIC         finally:
+-- MAGIC           if override_file and os.path.exists(override_file):
+-- MAGIC             os.remove(override_file)
+-- MAGIC         emit_event("install_dependencies", install_dependencies_start)
+-- MAGIC
+-- MAGIC         env.pop("DATABRICKS_BUNDLE_RESTRICTED_CODE_EXECUTION", None)
+-- MAGIC       else:
+-- MAGIC         env["DATABRICKS_BUNDLE_RESTRICTED_CODE_EXECUTION"] = "1"
+-- MAGIC
+-- MAGIC       env.pop("DATABRICKS_CLUSTER_ID", None)
+-- MAGIC
+-- MAGIC       with tempfile.NamedTemporaryFile(mode='w+', dir=tmpdirname, delete=True) as databrickscfg_file:
+-- MAGIC           profile_name = "workspace_profile"
+-- MAGIC           databrickscfg_file.write(f"[workspace_profile]\nhost = {workspace_url}")
+-- MAGIC           databrickscfg_file.flush()
+-- MAGIC           env["DATABRICKS_CONFIG_FILE"] = databrickscfg_file.name
+-- MAGIC
+-- MAGIC           cli_command = [cli_exec_path] + shlex.split(args) + ["-p", profile_name]
+-- MAGIC           tmp_file_path = tmp_file
+-- MAGIC
+-- MAGIC           run_cli_start = time.monotonic()
+-- MAGIC           run_cli_phase = "run_cli_genie" if cli_upstream == "genie-code" else "run_cli"
+-- MAGIC           try:
+-- MAGIC             _cli_runner_run_cli_command_with_token(
+-- MAGIC               cli_command,
+-- MAGIC               cwd,
+-- MAGIC               tmp_file_path,
+-- MAGIC               include_stderr_in_error == "true",
+-- MAGIC               token,
+-- MAGIC               env,
+-- MAGIC               cli_upstream=cli_upstream,
+-- MAGIC             )
+-- MAGIC           finally:
+-- MAGIC             emit_event(run_cli_phase, run_cli_start)
+-- MAGIC
+-- MAGIC
+-- MAGIC try:
+-- MAGIC   _databricks_cli_runner()
+-- MAGIC finally:
+-- MAGIC   del (
+-- MAGIC     _databricks_cli_runner,
+-- MAGIC     _cli_runner_get_venv_path_from_databricks_yml,
+-- MAGIC     _cli_runner_get_download_url,
+-- MAGIC     _cli_runner_run_cli_command,
+-- MAGIC     _cli_runner_run_cli_command_with_token,
+-- MAGIC   )
+-- MAGIC None
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC def _cli_runner_get_venv_path_from_databricks_yml(cwd):
+-- MAGIC   import yaml
+-- MAGIC
+-- MAGIC   databricks_yml_path = f"{cwd}/databricks.yml"
+-- MAGIC   with open(databricks_yml_path, "r") as f:
+-- MAGIC     data = yaml.safe_load(f)
+-- MAGIC     return data.get("python", {}).get("venv_path", ".venv")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_run_cli_command(cli_command, cwd, tmp_file_path, include_stderr, env, *, cli_upstream):
+-- MAGIC   import os
+-- MAGIC   import subprocess
+-- MAGIC
+-- MAGIC   stderr_arg = subprocess.PIPE if include_stderr else None
+-- MAGIC   if tmp_file_path:
+-- MAGIC     os.makedirs(os.path.dirname(tmp_file_path), exist_ok=True)
+-- MAGIC     result = subprocess.run(cli_command, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr_arg, text=True, env=env)
+-- MAGIC     with open(tmp_file_path, 'w') as output_file:
+-- MAGIC         output_file.write(result.stdout)
+-- MAGIC         print(result.stdout)
+-- MAGIC   else:
+-- MAGIC     result = subprocess.run(cli_command, cwd=cwd, stderr=stderr_arg, text=True, env=env)
+-- MAGIC   if result.returncode != 0:
+-- MAGIC     error_msg = f"Command {result.args[:3]} failed with exit code {result.returncode}"
+-- MAGIC     if include_stderr and result.stderr:
+-- MAGIC       error_msg += f":\n{result.stderr}"
+-- MAGIC     raise RuntimeError(error_msg)
+-- MAGIC
+-- MAGIC   if cli_upstream == "genie-code":
+-- MAGIC     print(result.stderr)
+-- MAGIC
+-- MAGIC     try:
+-- MAGIC       with open("/Workspace/.proc/self/status", "r") as status_file:
+-- MAGIC         status_file.read()
+-- MAGIC     except Exception as e:
+-- MAGIC       print(f"Warning: Failed to read /Workspace/.proc/self/status: {e}")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_run_cli_command_with_token(cli_command, cwd, tmp_file_path, include_stderr, token, env, *, cli_upstream):
+-- MAGIC   _cli_runner_run_cli_command(
+-- MAGIC     cli_command,
+-- MAGIC     cwd,
+-- MAGIC     tmp_file_path,
+-- MAGIC     include_stderr,
+-- MAGIC     {**env, "DATABRICKS_TOKEN": token},
+-- MAGIC     cli_upstream=cli_upstream,
+-- MAGIC   )
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_get_download_url(workspace_url, token, file_api_path, runner_download_error_marker):
+-- MAGIC   import requests
+-- MAGIC   import time
+-- MAGIC
+-- MAGIC   api_create_download_url = f"{workspace_url}/api/2.0/fs/create-download-url"
+-- MAGIC   headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+-- MAGIC   data = {"path": file_api_path}
+-- MAGIC
+-- MAGIC   max_attempts = 3
+-- MAGIC   last_error = None
+-- MAGIC   for attempt in range(max_attempts):
+-- MAGIC     try:
+-- MAGIC       response = requests.post(api_create_download_url, headers=headers, json=data)
+-- MAGIC       if response.status_code == 200:
+-- MAGIC         return response.json()["url"]
+-- MAGIC       last_error = f"HTTP {response.status_code} {response.text}"
+-- MAGIC     except requests.RequestException as e:
+-- MAGIC       last_error = str(e)
+-- MAGIC     if attempt < max_attempts - 1:
+-- MAGIC       time.sleep(2 ** attempt)
+-- MAGIC
+-- MAGIC   print(f"{runner_download_error_marker}: {file_api_path} {last_error}")
+-- MAGIC   raise RuntimeError(f"Failed to download {file_api_path}: {last_error}")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _databricks_cli_runner():
+-- MAGIC   import hashlib
+-- MAGIC   import os
+-- MAGIC   import platform
+-- MAGIC   import requests
+-- MAGIC   import shlex
+-- MAGIC   import shutil
+-- MAGIC   import subprocess
+-- MAGIC   import tempfile
+-- MAGIC   import time
+-- MAGIC   import zipfile
+-- MAGIC   from dbruntime.databricks_repl_context import get_context
+-- MAGIC   from urllib.parse import urlparse
+-- MAGIC
+-- MAGIC   cli_version = "1.20.0"
+-- MAGIC   terraform_version = ""
+-- MAGIC   provider_version = ""
+-- MAGIC   cwd = ""
+-- MAGIC   args = "apps get simple-customer-api --output JSON"
+-- MAGIC   tmp_file = ""
+-- MAGIC   dev_cli_snippet = ""
+-- MAGIC   artifact_download_error_prefix = "DABsRunnerError: Failed to download CLI dependency"
+-- MAGIC   runner_download_error_marker = "DabsRunnerErrorFallback: Downloading error, using fallback URL"
+-- MAGIC   allow_python_execution = "false"
+-- MAGIC   enable_yaml_sync = "true"
+-- MAGIC   include_stderr_in_error = "true"
+-- MAGIC   cli_upstream = "genie-code"
+-- MAGIC   enforce_serverless = "true"
+-- MAGIC   use_context_api_url = "false"
+-- MAGIC
+-- MAGIC   if enforce_serverless == "true" and os.environ.get("IS_SERVERLESS", "").strip().lower() != "true":
+-- MAGIC     raise RuntimeError("Databricks CLI runner must run on serverless compute")
+-- MAGIC
+-- MAGIC   setup_runner_environment_start = time.monotonic()
+-- MAGIC   ctx = get_context()
+-- MAGIC   token = ctx.apiToken
+-- MAGIC   if use_context_api_url == "true":
+-- MAGIC     workspace_url = f"https://{urlparse(ctx.apiUrl).netloc}"
+-- MAGIC   else:
+-- MAGIC     workspace_url = f"https://{spark.conf.get('spark.databricks.workspaceUrl')}"
+-- MAGIC   cpu_arch = "linux_arm64" if platform.machine() == "aarch64" else "linux_amd64"
+-- MAGIC
+-- MAGIC   env = os.environ.copy()
+-- MAGIC
+-- MAGIC   def emit_event(phase, start_time):
+-- MAGIC     print(f"\n__RUNNER_PHASE__:{phase}:{(time.monotonic() - start_time) * 1000:.0f}", flush=True)
+-- MAGIC
+-- MAGIC   def get_download_url(file_api_path):
+-- MAGIC     return _cli_runner_get_download_url(
+-- MAGIC       workspace_url, token, file_api_path, runner_download_error_marker
+-- MAGIC     )
+-- MAGIC
+-- MAGIC   def download_and_extract(file_url, dest_dir):
+-- MAGIC     response = requests.get(file_url)
+-- MAGIC     if response.status_code != 200:
+-- MAGIC       raise RuntimeError(f"HTTP {response.status_code} while downloading artifact: {response.text}")
+-- MAGIC     tmp_file = f"{dest_dir}.zip"
+-- MAGIC
+-- MAGIC     with open(tmp_file, "wb") as zip_file:
+-- MAGIC         zip_file.write(response.content)
+-- MAGIC     with zipfile.ZipFile(tmp_file, 'r') as zip_ref:
+-- MAGIC         zip_ref.extractall(dest_dir)
+-- MAGIC
+-- MAGIC   def download_artifact_if_not_exists(input_file_name, binary_name, dest_path, tmp_dir):
+-- MAGIC     if os.path.exists(dest_path):
+-- MAGIC       return
+-- MAGIC
+-- MAGIC     try:
+-- MAGIC       os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+-- MAGIC
+-- MAGIC       path_prefix = f"/DatabricksInternal/Jobs/ArtifactRepository/public/databricks-cli-binaries/{cli_version}"
+-- MAGIC       download_url = get_download_url(f"{path_prefix}/{input_file_name}.zip")
+-- MAGIC
+-- MAGIC       tmp_archive_dir = f"{tmp_dir}/{input_file_name}"
+-- MAGIC       download_and_extract(download_url, tmp_archive_dir)
+-- MAGIC
+-- MAGIC       src_path = f"{tmp_archive_dir}/{binary_name}"
+-- MAGIC       if not os.path.exists(src_path):
+-- MAGIC         available = ", ".join(os.listdir(tmp_archive_dir)) if os.path.isdir(tmp_archive_dir) else "(missing archive directory)"
+-- MAGIC         raise RuntimeError(f"Expected binary '{binary_name}' not found in archive contents: {available}")
+-- MAGIC
+-- MAGIC       shutil.move(src_path, dest_path)
+-- MAGIC       os.chmod(dest_path, 0o755)
+-- MAGIC     except Exception as e:
+-- MAGIC       versions_info = f"CLI v{cli_version}, TF v{terraform_version}, TF provider v{provider_version}" if terraform_version else f"CLI v{cli_version}"
+-- MAGIC       error_msg = f"{artifact_download_error_prefix} {input_file_name}/{binary_name} {versions_info}: {str(e)}"
+-- MAGIC       raise RuntimeError(f"{error_msg}")
+-- MAGIC
+-- MAGIC   tmp_base = os.path.expanduser("~/tmp")
+-- MAGIC   if not os.path.exists(tmp_base):
+-- MAGIC     os.makedirs(tmp_base)
+-- MAGIC   os.chmod(tmp_base, 0o700)
+-- MAGIC
+-- MAGIC   with tempfile.TemporaryDirectory(dir=tmp_base) as tmpdirname:
+-- MAGIC       emit_event("setup_runner_environment", setup_runner_environment_start)
+-- MAGIC
+-- MAGIC       download_artifacts_start = time.monotonic()
+-- MAGIC       cli_exec_path = f"{tmp_base}/databricks_{cli_version}_{cpu_arch}"
+-- MAGIC       download_artifact_if_not_exists(
+-- MAGIC         f"databricks_cli_{cpu_arch}",
+-- MAGIC         "databricks",
+-- MAGIC         cli_exec_path,
+-- MAGIC         tmpdirname
+-- MAGIC       )
+-- MAGIC
+-- MAGIC       if terraform_version:
+-- MAGIC         terraform_base = f"{tmp_base}/terraform"
+-- MAGIC         terraform_exec_path = f"{terraform_base}/terraform_{terraform_version}_{cpu_arch}"
+-- MAGIC         download_artifact_if_not_exists(
+-- MAGIC           f"terraform_{cpu_arch}",
+-- MAGIC           "terraform",
+-- MAGIC           terraform_exec_path,
+-- MAGIC           tmpdirname
+-- MAGIC         )
+-- MAGIC
+-- MAGIC         provider_mirror_base = f"{terraform_base}/providers"
+-- MAGIC         provider_mirror_dir = f"{provider_mirror_base}/registry.terraform.io/databricks/databricks/{provider_version}/{cpu_arch}"
+-- MAGIC         os.makedirs(provider_mirror_dir, exist_ok=True)
+-- MAGIC         provider_exec_path = f"{provider_mirror_dir}/terraform-provider-databricks_v{provider_version}"
+-- MAGIC         download_artifact_if_not_exists(
+-- MAGIC           f"terraform_provider_{cpu_arch}",
+-- MAGIC           f"terraform-provider-databricks_v{provider_version}",
+-- MAGIC           provider_exec_path,
+-- MAGIC           tmpdirname
+-- MAGIC         )
+-- MAGIC       emit_event("download_artifacts", download_artifacts_start)
+-- MAGIC
+-- MAGIC       setup_cli_environment_start = time.monotonic()
+-- MAGIC       if terraform_version:
+-- MAGIC         terraform_cli_config_path = f"{terraform_base}/terraform-cli-config"
+-- MAGIC         if not os.path.exists(terraform_cli_config_path):
+-- MAGIC           terraform_cli_config = f'''provider_installation {{
+-- MAGIC   filesystem_mirror {{
+-- MAGIC     path    = "{provider_mirror_base}"
+-- MAGIC     include = ["registry.terraform.io/databricks/databricks"]
+-- MAGIC   }}
+-- MAGIC   direct {{
+-- MAGIC     exclude = ["registry.terraform.io/databricks/databricks"]
+-- MAGIC   }}
+-- MAGIC }}
+-- MAGIC disable_checkpoint = true
+-- MAGIC disable_checkpoint_signature = true
+-- MAGIC '''
+-- MAGIC
+-- MAGIC           with open(terraform_cli_config_path, 'w') as f:
+-- MAGIC             f.write(terraform_cli_config)
+-- MAGIC
+-- MAGIC         env["DATABRICKS_TF_VERSION"] = terraform_version
+-- MAGIC         env["DATABRICKS_TF_EXEC_PATH"] = terraform_exec_path
+-- MAGIC         env["DATABRICKS_TF_PROVIDER_VERSION"] = provider_version
+-- MAGIC         env["DATABRICKS_TF_CLI_CONFIG_FILE"] = terraform_cli_config_path
+-- MAGIC         env["TF_CLI_CONFIG_FILE"] = terraform_cli_config_path
+-- MAGIC
+-- MAGIC       cwd = os.path.normpath(f"/Workspace{cwd}")
+-- MAGIC
+-- MAGIC       if dev_cli_snippet:
+-- MAGIC         cli_path = cli_exec_path
+-- MAGIC         exec(dev_cli_snippet, globals(), locals())
+-- MAGIC
+-- MAGIC       env["DATABRICKS_BUNDLE_TMP"] = f"{tmp_base}/bundle-2-{hashlib.sha256(cwd.encode()).hexdigest()}"
+-- MAGIC       env["DATABRICKS_CLI_UPSTREAM"] = cli_upstream
+-- MAGIC
+-- MAGIC       if enable_yaml_sync == "true":
+-- MAGIC         env["DATABRICKS_BUNDLE_ENABLE_EXPERIMENTAL_YAML_SYNC"] = "1"
+-- MAGIC       else:
+-- MAGIC         env.pop("DATABRICKS_BUNDLE_ENABLE_EXPERIMENTAL_YAML_SYNC", None)
+-- MAGIC
+-- MAGIC       env["DATABRICKS_BUNDLE_ENGINE"] = "direct"
+-- MAGIC
+-- MAGIC       emit_event("setup_cli_environment", setup_cli_environment_start)
+-- MAGIC
+-- MAGIC       if allow_python_execution == "true":
+-- MAGIC         install_dependencies_start = time.monotonic()
+-- MAGIC         venv_path = _cli_runner_get_venv_path_from_databricks_yml(cwd)
+-- MAGIC         venv_folder_path = os.path.normpath(f"{cwd}/{venv_path}")
+-- MAGIC         venv_bin_path = f"{venv_folder_path}/bin"
+-- MAGIC
+-- MAGIC         os.makedirs(venv_bin_path, exist_ok=True)
+-- MAGIC
+-- MAGIC         python3_wrapper_path = f"{venv_bin_path}/python3"
+-- MAGIC         if not os.path.exists(python3_wrapper_path):
+-- MAGIC           with open(python3_wrapper_path, "w") as f:
+-- MAGIC             f.write('#!/usr/bin/env bash\nexec python3 "$@"\n')
+-- MAGIC           os.chmod(python3_wrapper_path, 0o755)
+-- MAGIC
+-- MAGIC         pyvenv_cfg_path = f"{venv_folder_path}/pyvenv.cfg"
+-- MAGIC         if not os.path.exists(pyvenv_cfg_path):
+-- MAGIC           with open(pyvenv_cfg_path, "w") as f:
+-- MAGIC             pass
+-- MAGIC
+-- MAGIC         pyproject_path = f"{cwd}/pyproject.toml"
+-- MAGIC         uv_pip_install_args = ["uv", "pip", "install", "--quiet", "--python", python3_wrapper_path, "--link-mode=copy"]
+-- MAGIC
+-- MAGIC         override_file = None
+-- MAGIC         if os.path.exists(pyproject_path):
+-- MAGIC           uv_pip_install_args.extend(["-r", pyproject_path, "--group", "dev"])
+-- MAGIC         else:
+-- MAGIC           uv_pip_install_args.append(f"databricks-bundles=={cli_version}")
+-- MAGIC
+-- MAGIC         try:
+-- MAGIC           subprocess.run(uv_pip_install_args, check=True, cwd=cwd, stdout=subprocess.DEVNULL, env=env)
+-- MAGIC         finally:
+-- MAGIC           if override_file and os.path.exists(override_file):
+-- MAGIC             os.remove(override_file)
+-- MAGIC         emit_event("install_dependencies", install_dependencies_start)
+-- MAGIC
+-- MAGIC         env.pop("DATABRICKS_BUNDLE_RESTRICTED_CODE_EXECUTION", None)
+-- MAGIC       else:
+-- MAGIC         env["DATABRICKS_BUNDLE_RESTRICTED_CODE_EXECUTION"] = "1"
+-- MAGIC
+-- MAGIC       env.pop("DATABRICKS_CLUSTER_ID", None)
+-- MAGIC
+-- MAGIC       with tempfile.NamedTemporaryFile(mode='w+', dir=tmpdirname, delete=True) as databrickscfg_file:
+-- MAGIC           profile_name = "workspace_profile"
+-- MAGIC           databrickscfg_file.write(f"[workspace_profile]\nhost = {workspace_url}")
+-- MAGIC           databrickscfg_file.flush()
+-- MAGIC           env["DATABRICKS_CONFIG_FILE"] = databrickscfg_file.name
+-- MAGIC
+-- MAGIC           cli_command = [cli_exec_path] + shlex.split(args) + ["-p", profile_name]
+-- MAGIC           tmp_file_path = tmp_file
+-- MAGIC
+-- MAGIC           run_cli_start = time.monotonic()
+-- MAGIC           run_cli_phase = "run_cli_genie" if cli_upstream == "genie-code" else "run_cli"
+-- MAGIC           try:
+-- MAGIC             _cli_runner_run_cli_command_with_token(
+-- MAGIC               cli_command,
+-- MAGIC               cwd,
+-- MAGIC               tmp_file_path,
+-- MAGIC               include_stderr_in_error == "true",
+-- MAGIC               token,
+-- MAGIC               env,
+-- MAGIC               cli_upstream=cli_upstream,
+-- MAGIC             )
+-- MAGIC           finally:
+-- MAGIC             emit_event(run_cli_phase, run_cli_start)
+-- MAGIC
+-- MAGIC
+-- MAGIC try:
+-- MAGIC   _databricks_cli_runner()
+-- MAGIC finally:
+-- MAGIC   del (
+-- MAGIC     _databricks_cli_runner,
+-- MAGIC     _cli_runner_get_venv_path_from_databricks_yml,
+-- MAGIC     _cli_runner_get_download_url,
+-- MAGIC     _cli_runner_run_cli_command,
+-- MAGIC     _cli_runner_run_cli_command_with_token,
+-- MAGIC   )
+-- MAGIC None
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC def _cli_runner_get_venv_path_from_databricks_yml(cwd):
+-- MAGIC   import yaml
+-- MAGIC
+-- MAGIC   databricks_yml_path = f"{cwd}/databricks.yml"
+-- MAGIC   with open(databricks_yml_path, "r") as f:
+-- MAGIC     data = yaml.safe_load(f)
+-- MAGIC     return data.get("python", {}).get("venv_path", ".venv")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_run_cli_command(cli_command, cwd, tmp_file_path, include_stderr, env, *, cli_upstream):
+-- MAGIC   import os
+-- MAGIC   import subprocess
+-- MAGIC
+-- MAGIC   stderr_arg = subprocess.PIPE if include_stderr else None
+-- MAGIC   if tmp_file_path:
+-- MAGIC     os.makedirs(os.path.dirname(tmp_file_path), exist_ok=True)
+-- MAGIC     result = subprocess.run(cli_command, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr_arg, text=True, env=env)
+-- MAGIC     with open(tmp_file_path, 'w') as output_file:
+-- MAGIC         output_file.write(result.stdout)
+-- MAGIC         print(result.stdout)
+-- MAGIC   else:
+-- MAGIC     result = subprocess.run(cli_command, cwd=cwd, stderr=stderr_arg, text=True, env=env)
+-- MAGIC   if result.returncode != 0:
+-- MAGIC     error_msg = f"Command {result.args[:3]} failed with exit code {result.returncode}"
+-- MAGIC     if include_stderr and result.stderr:
+-- MAGIC       error_msg += f":\n{result.stderr}"
+-- MAGIC     raise RuntimeError(error_msg)
+-- MAGIC
+-- MAGIC   if cli_upstream == "genie-code":
+-- MAGIC     print(result.stderr)
+-- MAGIC
+-- MAGIC     try:
+-- MAGIC       with open("/Workspace/.proc/self/status", "r") as status_file:
+-- MAGIC         status_file.read()
+-- MAGIC     except Exception as e:
+-- MAGIC       print(f"Warning: Failed to read /Workspace/.proc/self/status: {e}")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_run_cli_command_with_token(cli_command, cwd, tmp_file_path, include_stderr, token, env, *, cli_upstream):
+-- MAGIC   _cli_runner_run_cli_command(
+-- MAGIC     cli_command,
+-- MAGIC     cwd,
+-- MAGIC     tmp_file_path,
+-- MAGIC     include_stderr,
+-- MAGIC     {**env, "DATABRICKS_TOKEN": token},
+-- MAGIC     cli_upstream=cli_upstream,
+-- MAGIC   )
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_get_download_url(workspace_url, token, file_api_path, runner_download_error_marker):
+-- MAGIC   import requests
+-- MAGIC   import time
+-- MAGIC
+-- MAGIC   api_create_download_url = f"{workspace_url}/api/2.0/fs/create-download-url"
+-- MAGIC   headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+-- MAGIC   data = {"path": file_api_path}
+-- MAGIC
+-- MAGIC   max_attempts = 3
+-- MAGIC   last_error = None
+-- MAGIC   for attempt in range(max_attempts):
+-- MAGIC     try:
+-- MAGIC       response = requests.post(api_create_download_url, headers=headers, json=data)
+-- MAGIC       if response.status_code == 200:
+-- MAGIC         return response.json()["url"]
+-- MAGIC       last_error = f"HTTP {response.status_code} {response.text}"
+-- MAGIC     except requests.RequestException as e:
+-- MAGIC       last_error = str(e)
+-- MAGIC     if attempt < max_attempts - 1:
+-- MAGIC       time.sleep(2 ** attempt)
+-- MAGIC
+-- MAGIC   print(f"{runner_download_error_marker}: {file_api_path} {last_error}")
+-- MAGIC   raise RuntimeError(f"Failed to download {file_api_path}: {last_error}")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _databricks_cli_runner():
+-- MAGIC   import hashlib
+-- MAGIC   import os
+-- MAGIC   import platform
+-- MAGIC   import requests
+-- MAGIC   import shlex
+-- MAGIC   import shutil
+-- MAGIC   import subprocess
+-- MAGIC   import tempfile
+-- MAGIC   import time
+-- MAGIC   import zipfile
+-- MAGIC   from dbruntime.databricks_repl_context import get_context
+-- MAGIC   from urllib.parse import urlparse
+-- MAGIC
+-- MAGIC   cli_version = "1.20.0"
+-- MAGIC   terraform_version = ""
+-- MAGIC   provider_version = ""
+-- MAGIC   cwd = ""
+-- MAGIC   args = "apps get simple-customer-api --output JSON"
+-- MAGIC   tmp_file = ""
+-- MAGIC   dev_cli_snippet = ""
+-- MAGIC   artifact_download_error_prefix = "DABsRunnerError: Failed to download CLI dependency"
+-- MAGIC   runner_download_error_marker = "DabsRunnerErrorFallback: Downloading error, using fallback URL"
+-- MAGIC   allow_python_execution = "false"
+-- MAGIC   enable_yaml_sync = "true"
+-- MAGIC   include_stderr_in_error = "true"
+-- MAGIC   cli_upstream = "genie-code"
+-- MAGIC   enforce_serverless = "true"
+-- MAGIC   use_context_api_url = "false"
+-- MAGIC
+-- MAGIC   if enforce_serverless == "true" and os.environ.get("IS_SERVERLESS", "").strip().lower() != "true":
+-- MAGIC     raise RuntimeError("Databricks CLI runner must run on serverless compute")
+-- MAGIC
+-- MAGIC   setup_runner_environment_start = time.monotonic()
+-- MAGIC   ctx = get_context()
+-- MAGIC   token = ctx.apiToken
+-- MAGIC   if use_context_api_url == "true":
+-- MAGIC     workspace_url = f"https://{urlparse(ctx.apiUrl).netloc}"
+-- MAGIC   else:
+-- MAGIC     workspace_url = f"https://{spark.conf.get('spark.databricks.workspaceUrl')}"
+-- MAGIC   cpu_arch = "linux_arm64" if platform.machine() == "aarch64" else "linux_amd64"
+-- MAGIC
+-- MAGIC   env = os.environ.copy()
+-- MAGIC
+-- MAGIC   def emit_event(phase, start_time):
+-- MAGIC     print(f"\n__RUNNER_PHASE__:{phase}:{(time.monotonic() - start_time) * 1000:.0f}", flush=True)
+-- MAGIC
+-- MAGIC   def get_download_url(file_api_path):
+-- MAGIC     return _cli_runner_get_download_url(
+-- MAGIC       workspace_url, token, file_api_path, runner_download_error_marker
+-- MAGIC     )
+-- MAGIC
+-- MAGIC   def download_and_extract(file_url, dest_dir):
+-- MAGIC     response = requests.get(file_url)
+-- MAGIC     if response.status_code != 200:
+-- MAGIC       raise RuntimeError(f"HTTP {response.status_code} while downloading artifact: {response.text}")
+-- MAGIC     tmp_file = f"{dest_dir}.zip"
+-- MAGIC
+-- MAGIC     with open(tmp_file, "wb") as zip_file:
+-- MAGIC         zip_file.write(response.content)
+-- MAGIC     with zipfile.ZipFile(tmp_file, 'r') as zip_ref:
+-- MAGIC         zip_ref.extractall(dest_dir)
+-- MAGIC
+-- MAGIC   def download_artifact_if_not_exists(input_file_name, binary_name, dest_path, tmp_dir):
+-- MAGIC     if os.path.exists(dest_path):
+-- MAGIC       return
+-- MAGIC
+-- MAGIC     try:
+-- MAGIC       os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+-- MAGIC
+-- MAGIC       path_prefix = f"/DatabricksInternal/Jobs/ArtifactRepository/public/databricks-cli-binaries/{cli_version}"
+-- MAGIC       download_url = get_download_url(f"{path_prefix}/{input_file_name}.zip")
+-- MAGIC
+-- MAGIC       tmp_archive_dir = f"{tmp_dir}/{input_file_name}"
+-- MAGIC       download_and_extract(download_url, tmp_archive_dir)
+-- MAGIC
+-- MAGIC       src_path = f"{tmp_archive_dir}/{binary_name}"
+-- MAGIC       if not os.path.exists(src_path):
+-- MAGIC         available = ", ".join(os.listdir(tmp_archive_dir)) if os.path.isdir(tmp_archive_dir) else "(missing archive directory)"
+-- MAGIC         raise RuntimeError(f"Expected binary '{binary_name}' not found in archive contents: {available}")
+-- MAGIC
+-- MAGIC       shutil.move(src_path, dest_path)
+-- MAGIC       os.chmod(dest_path, 0o755)
+-- MAGIC     except Exception as e:
+-- MAGIC       versions_info = f"CLI v{cli_version}, TF v{terraform_version}, TF provider v{provider_version}" if terraform_version else f"CLI v{cli_version}"
+-- MAGIC       error_msg = f"{artifact_download_error_prefix} {input_file_name}/{binary_name} {versions_info}: {str(e)}"
+-- MAGIC       raise RuntimeError(f"{error_msg}")
+-- MAGIC
+-- MAGIC   tmp_base = os.path.expanduser("~/tmp")
+-- MAGIC   if not os.path.exists(tmp_base):
+-- MAGIC     os.makedirs(tmp_base)
+-- MAGIC   os.chmod(tmp_base, 0o700)
+-- MAGIC
+-- MAGIC   with tempfile.TemporaryDirectory(dir=tmp_base) as tmpdirname:
+-- MAGIC       emit_event("setup_runner_environment", setup_runner_environment_start)
+-- MAGIC
+-- MAGIC       download_artifacts_start = time.monotonic()
+-- MAGIC       cli_exec_path = f"{tmp_base}/databricks_{cli_version}_{cpu_arch}"
+-- MAGIC       download_artifact_if_not_exists(
+-- MAGIC         f"databricks_cli_{cpu_arch}",
+-- MAGIC         "databricks",
+-- MAGIC         cli_exec_path,
+-- MAGIC         tmpdirname
+-- MAGIC       )
+-- MAGIC
+-- MAGIC       if terraform_version:
+-- MAGIC         terraform_base = f"{tmp_base}/terraform"
+-- MAGIC         terraform_exec_path = f"{terraform_base}/terraform_{terraform_version}_{cpu_arch}"
+-- MAGIC         download_artifact_if_not_exists(
+-- MAGIC           f"terraform_{cpu_arch}",
+-- MAGIC           "terraform",
+-- MAGIC           terraform_exec_path,
+-- MAGIC           tmpdirname
+-- MAGIC         )
+-- MAGIC
+-- MAGIC         provider_mirror_base = f"{terraform_base}/providers"
+-- MAGIC         provider_mirror_dir = f"{provider_mirror_base}/registry.terraform.io/databricks/databricks/{provider_version}/{cpu_arch}"
+-- MAGIC         os.makedirs(provider_mirror_dir, exist_ok=True)
+-- MAGIC         provider_exec_path = f"{provider_mirror_dir}/terraform-provider-databricks_v{provider_version}"
+-- MAGIC         download_artifact_if_not_exists(
+-- MAGIC           f"terraform_provider_{cpu_arch}",
+-- MAGIC           f"terraform-provider-databricks_v{provider_version}",
+-- MAGIC           provider_exec_path,
+-- MAGIC           tmpdirname
+-- MAGIC         )
+-- MAGIC       emit_event("download_artifacts", download_artifacts_start)
+-- MAGIC
+-- MAGIC       setup_cli_environment_start = time.monotonic()
+-- MAGIC       if terraform_version:
+-- MAGIC         terraform_cli_config_path = f"{terraform_base}/terraform-cli-config"
+-- MAGIC         if not os.path.exists(terraform_cli_config_path):
+-- MAGIC           terraform_cli_config = f'''provider_installation {{
+-- MAGIC   filesystem_mirror {{
+-- MAGIC     path    = "{provider_mirror_base}"
+-- MAGIC     include = ["registry.terraform.io/databricks/databricks"]
+-- MAGIC   }}
+-- MAGIC   direct {{
+-- MAGIC     exclude = ["registry.terraform.io/databricks/databricks"]
+-- MAGIC   }}
+-- MAGIC }}
+-- MAGIC disable_checkpoint = true
+-- MAGIC disable_checkpoint_signature = true
+-- MAGIC '''
+-- MAGIC
+-- MAGIC           with open(terraform_cli_config_path, 'w') as f:
+-- MAGIC             f.write(terraform_cli_config)
+-- MAGIC
+-- MAGIC         env["DATABRICKS_TF_VERSION"] = terraform_version
+-- MAGIC         env["DATABRICKS_TF_EXEC_PATH"] = terraform_exec_path
+-- MAGIC         env["DATABRICKS_TF_PROVIDER_VERSION"] = provider_version
+-- MAGIC         env["DATABRICKS_TF_CLI_CONFIG_FILE"] = terraform_cli_config_path
+-- MAGIC         env["TF_CLI_CONFIG_FILE"] = terraform_cli_config_path
+-- MAGIC
+-- MAGIC       cwd = os.path.normpath(f"/Workspace{cwd}")
+-- MAGIC
+-- MAGIC       if dev_cli_snippet:
+-- MAGIC         cli_path = cli_exec_path
+-- MAGIC         exec(dev_cli_snippet, globals(), locals())
+-- MAGIC
+-- MAGIC       env["DATABRICKS_BUNDLE_TMP"] = f"{tmp_base}/bundle-2-{hashlib.sha256(cwd.encode()).hexdigest()}"
+-- MAGIC       env["DATABRICKS_CLI_UPSTREAM"] = cli_upstream
+-- MAGIC
+-- MAGIC       if enable_yaml_sync == "true":
+-- MAGIC         env["DATABRICKS_BUNDLE_ENABLE_EXPERIMENTAL_YAML_SYNC"] = "1"
+-- MAGIC       else:
+-- MAGIC         env.pop("DATABRICKS_BUNDLE_ENABLE_EXPERIMENTAL_YAML_SYNC", None)
+-- MAGIC
+-- MAGIC       env["DATABRICKS_BUNDLE_ENGINE"] = "direct"
+-- MAGIC
+-- MAGIC       emit_event("setup_cli_environment", setup_cli_environment_start)
+-- MAGIC
+-- MAGIC       if allow_python_execution == "true":
+-- MAGIC         install_dependencies_start = time.monotonic()
+-- MAGIC         venv_path = _cli_runner_get_venv_path_from_databricks_yml(cwd)
+-- MAGIC         venv_folder_path = os.path.normpath(f"{cwd}/{venv_path}")
+-- MAGIC         venv_bin_path = f"{venv_folder_path}/bin"
+-- MAGIC
+-- MAGIC         os.makedirs(venv_bin_path, exist_ok=True)
+-- MAGIC
+-- MAGIC         python3_wrapper_path = f"{venv_bin_path}/python3"
+-- MAGIC         if not os.path.exists(python3_wrapper_path):
+-- MAGIC           with open(python3_wrapper_path, "w") as f:
+-- MAGIC             f.write('#!/usr/bin/env bash\nexec python3 "$@"\n')
+-- MAGIC           os.chmod(python3_wrapper_path, 0o755)
+-- MAGIC
+-- MAGIC         pyvenv_cfg_path = f"{venv_folder_path}/pyvenv.cfg"
+-- MAGIC         if not os.path.exists(pyvenv_cfg_path):
+-- MAGIC           with open(pyvenv_cfg_path, "w") as f:
+-- MAGIC             pass
+-- MAGIC
+-- MAGIC         pyproject_path = f"{cwd}/pyproject.toml"
+-- MAGIC         uv_pip_install_args = ["uv", "pip", "install", "--quiet", "--python", python3_wrapper_path, "--link-mode=copy"]
+-- MAGIC
+-- MAGIC         override_file = None
+-- MAGIC         if os.path.exists(pyproject_path):
+-- MAGIC           uv_pip_install_args.extend(["-r", pyproject_path, "--group", "dev"])
+-- MAGIC         else:
+-- MAGIC           uv_pip_install_args.append(f"databricks-bundles=={cli_version}")
+-- MAGIC
+-- MAGIC         try:
+-- MAGIC           subprocess.run(uv_pip_install_args, check=True, cwd=cwd, stdout=subprocess.DEVNULL, env=env)
+-- MAGIC         finally:
+-- MAGIC           if override_file and os.path.exists(override_file):
+-- MAGIC             os.remove(override_file)
+-- MAGIC         emit_event("install_dependencies", install_dependencies_start)
+-- MAGIC
+-- MAGIC         env.pop("DATABRICKS_BUNDLE_RESTRICTED_CODE_EXECUTION", None)
+-- MAGIC       else:
+-- MAGIC         env["DATABRICKS_BUNDLE_RESTRICTED_CODE_EXECUTION"] = "1"
+-- MAGIC
+-- MAGIC       env.pop("DATABRICKS_CLUSTER_ID", None)
+-- MAGIC
+-- MAGIC       with tempfile.NamedTemporaryFile(mode='w+', dir=tmpdirname, delete=True) as databrickscfg_file:
+-- MAGIC           profile_name = "workspace_profile"
+-- MAGIC           databrickscfg_file.write(f"[workspace_profile]\nhost = {workspace_url}")
+-- MAGIC           databrickscfg_file.flush()
+-- MAGIC           env["DATABRICKS_CONFIG_FILE"] = databrickscfg_file.name
+-- MAGIC
+-- MAGIC           cli_command = [cli_exec_path] + shlex.split(args) + ["-p", profile_name]
+-- MAGIC           tmp_file_path = tmp_file
+-- MAGIC
+-- MAGIC           run_cli_start = time.monotonic()
+-- MAGIC           run_cli_phase = "run_cli_genie" if cli_upstream == "genie-code" else "run_cli"
+-- MAGIC           try:
+-- MAGIC             _cli_runner_run_cli_command_with_token(
+-- MAGIC               cli_command,
+-- MAGIC               cwd,
+-- MAGIC               tmp_file_path,
+-- MAGIC               include_stderr_in_error == "true",
+-- MAGIC               token,
+-- MAGIC               env,
+-- MAGIC               cli_upstream=cli_upstream,
+-- MAGIC             )
+-- MAGIC           finally:
+-- MAGIC             emit_event(run_cli_phase, run_cli_start)
+-- MAGIC
+-- MAGIC
+-- MAGIC try:
+-- MAGIC   _databricks_cli_runner()
+-- MAGIC finally:
+-- MAGIC   del (
+-- MAGIC     _databricks_cli_runner,
+-- MAGIC     _cli_runner_get_venv_path_from_databricks_yml,
+-- MAGIC     _cli_runner_get_download_url,
+-- MAGIC     _cli_runner_run_cli_command,
+-- MAGIC     _cli_runner_run_cli_command_with_token,
+-- MAGIC   )
+-- MAGIC None
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC def _cli_runner_get_venv_path_from_databricks_yml(cwd):
+-- MAGIC   import yaml
+-- MAGIC
+-- MAGIC   databricks_yml_path = f"{cwd}/databricks.yml"
+-- MAGIC   with open(databricks_yml_path, "r") as f:
+-- MAGIC     data = yaml.safe_load(f)
+-- MAGIC     return data.get("python", {}).get("venv_path", ".venv")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_run_cli_command(cli_command, cwd, tmp_file_path, include_stderr, env, *, cli_upstream):
+-- MAGIC   import os
+-- MAGIC   import subprocess
+-- MAGIC
+-- MAGIC   stderr_arg = subprocess.PIPE if include_stderr else None
+-- MAGIC   if tmp_file_path:
+-- MAGIC     os.makedirs(os.path.dirname(tmp_file_path), exist_ok=True)
+-- MAGIC     result = subprocess.run(cli_command, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr_arg, text=True, env=env)
+-- MAGIC     with open(tmp_file_path, 'w') as output_file:
+-- MAGIC         output_file.write(result.stdout)
+-- MAGIC         print(result.stdout)
+-- MAGIC   else:
+-- MAGIC     result = subprocess.run(cli_command, cwd=cwd, stderr=stderr_arg, text=True, env=env)
+-- MAGIC   if result.returncode != 0:
+-- MAGIC     error_msg = f"Command {result.args[:3]} failed with exit code {result.returncode}"
+-- MAGIC     if include_stderr and result.stderr:
+-- MAGIC       error_msg += f":\n{result.stderr}"
+-- MAGIC     raise RuntimeError(error_msg)
+-- MAGIC
+-- MAGIC   if cli_upstream == "genie-code":
+-- MAGIC     print(result.stderr)
+-- MAGIC
+-- MAGIC     try:
+-- MAGIC       with open("/Workspace/.proc/self/status", "r") as status_file:
+-- MAGIC         status_file.read()
+-- MAGIC     except Exception as e:
+-- MAGIC       print(f"Warning: Failed to read /Workspace/.proc/self/status: {e}")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_run_cli_command_with_token(cli_command, cwd, tmp_file_path, include_stderr, token, env, *, cli_upstream):
+-- MAGIC   _cli_runner_run_cli_command(
+-- MAGIC     cli_command,
+-- MAGIC     cwd,
+-- MAGIC     tmp_file_path,
+-- MAGIC     include_stderr,
+-- MAGIC     {**env, "DATABRICKS_TOKEN": token},
+-- MAGIC     cli_upstream=cli_upstream,
+-- MAGIC   )
+-- MAGIC
+-- MAGIC
+-- MAGIC def _cli_runner_get_download_url(workspace_url, token, file_api_path, runner_download_error_marker):
+-- MAGIC   import requests
+-- MAGIC   import time
+-- MAGIC
+-- MAGIC   api_create_download_url = f"{workspace_url}/api/2.0/fs/create-download-url"
+-- MAGIC   headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+-- MAGIC   data = {"path": file_api_path}
+-- MAGIC
+-- MAGIC   max_attempts = 3
+-- MAGIC   last_error = None
+-- MAGIC   for attempt in range(max_attempts):
+-- MAGIC     try:
+-- MAGIC       response = requests.post(api_create_download_url, headers=headers, json=data)
+-- MAGIC       if response.status_code == 200:
+-- MAGIC         return response.json()["url"]
+-- MAGIC       last_error = f"HTTP {response.status_code} {response.text}"
+-- MAGIC     except requests.RequestException as e:
+-- MAGIC       last_error = str(e)
+-- MAGIC     if attempt < max_attempts - 1:
+-- MAGIC       time.sleep(2 ** attempt)
+-- MAGIC
+-- MAGIC   print(f"{runner_download_error_marker}: {file_api_path} {last_error}")
+-- MAGIC   raise RuntimeError(f"Failed to download {file_api_path}: {last_error}")
+-- MAGIC
+-- MAGIC
+-- MAGIC def _databricks_cli_runner():
+-- MAGIC   import hashlib
+-- MAGIC   import os
+-- MAGIC   import platform
+-- MAGIC   import requests
+-- MAGIC   import shlex
+-- MAGIC   import shutil
+-- MAGIC   import subprocess
+-- MAGIC   import tempfile
+-- MAGIC   import time
+-- MAGIC   import zipfile
+-- MAGIC   from dbruntime.databricks_repl_context import get_context
+-- MAGIC   from urllib.parse import urlparse
+-- MAGIC
+-- MAGIC   cli_version = "1.20.0"
+-- MAGIC   terraform_version = ""
+-- MAGIC   provider_version = ""
+-- MAGIC   cwd = ""
+-- MAGIC   args = "apps get simple-customer-api --output JSON"
+-- MAGIC   tmp_file = ""
+-- MAGIC   dev_cli_snippet = ""
+-- MAGIC   artifact_download_error_prefix = "DABsRunnerError: Failed to download CLI dependency"
+-- MAGIC   runner_download_error_marker = "DabsRunnerErrorFallback: Downloading error, using fallback URL"
+-- MAGIC   allow_python_execution = "false"
+-- MAGIC   enable_yaml_sync = "true"
+-- MAGIC   include_stderr_in_error = "true"
+-- MAGIC   cli_upstream = "genie-code"
+-- MAGIC   enforce_serverless = "true"
+-- MAGIC   use_context_api_url = "false"
+-- MAGIC
+-- MAGIC   if enforce_serverless == "true" and os.environ.get("IS_SERVERLESS", "").strip().lower() != "true":
+-- MAGIC     raise RuntimeError("Databricks CLI runner must run on serverless compute")
+-- MAGIC
+-- MAGIC   setup_runner_environment_start = time.monotonic()
+-- MAGIC   ctx = get_context()
+-- MAGIC   token = ctx.apiToken
+-- MAGIC   if use_context_api_url == "true":
+-- MAGIC     workspace_url = f"https://{urlparse(ctx.apiUrl).netloc}"
+-- MAGIC   else:
+-- MAGIC     workspace_url = f"https://{spark.conf.get('spark.databricks.workspaceUrl')}"
+-- MAGIC   cpu_arch = "linux_arm64" if platform.machine() == "aarch64" else "linux_amd64"
+-- MAGIC
+-- MAGIC   env = os.environ.copy()
+-- MAGIC
+-- MAGIC   def emit_event(phase, start_time):
+-- MAGIC     print(f"\n__RUNNER_PHASE__:{phase}:{(time.monotonic() - start_time) * 1000:.0f}", flush=True)
+-- MAGIC
+-- MAGIC   def get_download_url(file_api_path):
+-- MAGIC     return _cli_runner_get_download_url(
+-- MAGIC       workspace_url, token, file_api_path, runner_download_error_marker
+-- MAGIC     )
+-- MAGIC
+-- MAGIC   def download_and_extract(file_url, dest_dir):
+-- MAGIC     response = requests.get(file_url)
+-- MAGIC     if response.status_code != 200:
+-- MAGIC       raise RuntimeError(f"HTTP {response.status_code} while downloading artifact: {response.text}")
+-- MAGIC     tmp_file = f"{dest_dir}.zip"
+-- MAGIC
+-- MAGIC     with open(tmp_file, "wb") as zip_file:
+-- MAGIC         zip_file.write(response.content)
+-- MAGIC     with zipfile.ZipFile(tmp_file, 'r') as zip_ref:
+-- MAGIC         zip_ref.extractall(dest_dir)
+-- MAGIC
+-- MAGIC   def download_artifact_if_not_exists(input_file_name, binary_name, dest_path, tmp_dir):
+-- MAGIC     if os.path.exists(dest_path):
+-- MAGIC       return
+-- MAGIC
+-- MAGIC     try:
+-- MAGIC       os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+-- MAGIC
+-- MAGIC       path_prefix = f"/DatabricksInternal/Jobs/ArtifactRepository/public/databricks-cli-binaries/{cli_version}"
+-- MAGIC       download_url = get_download_url(f"{path_prefix}/{input_file_name}.zip")
+-- MAGIC
+-- MAGIC       tmp_archive_dir = f"{tmp_dir}/{input_file_name}"
+-- MAGIC       download_and_extract(download_url, tmp_archive_dir)
+-- MAGIC
+-- MAGIC       src_path = f"{tmp_archive_dir}/{binary_name}"
+-- MAGIC       if not os.path.exists(src_path):
+-- MAGIC         available = ", ".join(os.listdir(tmp_archive_dir)) if os.path.isdir(tmp_archive_dir) else "(missing archive directory)"
+-- MAGIC         raise RuntimeError(f"Expected binary '{binary_name}' not found in archive contents: {available}")
+-- MAGIC
+-- MAGIC       shutil.move(src_path, dest_path)
+-- MAGIC       os.chmod(dest_path, 0o755)
+-- MAGIC     except Exception as e:
+-- MAGIC       versions_info = f"CLI v{cli_version}, TF v{terraform_version}, TF provider v{provider_version}" if terraform_version else f"CLI v{cli_version}"
+-- MAGIC       error_msg = f"{artifact_download_error_prefix} {input_file_name}/{binary_name} {versions_info}: {str(e)}"
+-- MAGIC       raise RuntimeError(f"{error_msg}")
+-- MAGIC
+-- MAGIC   tmp_base = os.path.expanduser("~/tmp")
+-- MAGIC   if not os.path.exists(tmp_base):
+-- MAGIC     os.makedirs(tmp_base)
+-- MAGIC   os.chmod(tmp_base, 0o700)
+-- MAGIC
+-- MAGIC   with tempfile.TemporaryDirectory(dir=tmp_base) as tmpdirname:
+-- MAGIC       emit_event("setup_runner_environment", setup_runner_environment_start)
+-- MAGIC
+-- MAGIC       download_artifacts_start = time.monotonic()
+-- MAGIC       cli_exec_path = f"{tmp_base}/databricks_{cli_version}_{cpu_arch}"
+-- MAGIC       download_artifact_if_not_exists(
+-- MAGIC         f"databricks_cli_{cpu_arch}",
+-- MAGIC         "databricks",
+-- MAGIC         cli_exec_path,
+-- MAGIC         tmpdirname
+-- MAGIC       )
+-- MAGIC
+-- MAGIC       if terraform_version:
+-- MAGIC         terraform_base = f"{tmp_base}/terraform"
+-- MAGIC         terraform_exec_path = f"{terraform_base}/terraform_{terraform_version}_{cpu_arch}"
+-- MAGIC         download_artifact_if_not_exists(
+-- MAGIC           f"terraform_{cpu_arch}",
+-- MAGIC           "terraform",
+-- MAGIC           terraform_exec_path,
+-- MAGIC           tmpdirname
+-- MAGIC         )
+-- MAGIC
+-- MAGIC         provider_mirror_base = f"{terraform_base}/providers"
+-- MAGIC         provider_mirror_dir = f"{provider_mirror_base}/registry.terraform.io/databricks/databricks/{provider_version}/{cpu_arch}"
+-- MAGIC         os.makedirs(provider_mirror_dir, exist_ok=True)
+-- MAGIC         provider_exec_path = f"{provider_mirror_dir}/terraform-provider-databricks_v{provider_version}"
+-- MAGIC         download_artifact_if_not_exists(
+-- MAGIC           f"terraform_provider_{cpu_arch}",
+-- MAGIC           f"terraform-provider-databricks_v{provider_version}",
+-- MAGIC           provider_exec_path,
+-- MAGIC           tmpdirname
+-- MAGIC         )
+-- MAGIC       emit_event("download_artifacts", download_artifacts_start)
+-- MAGIC
+-- MAGIC       setup_cli_environment_start = time.monotonic()
+-- MAGIC       if terraform_version:
+-- MAGIC         terraform_cli_config_path = f"{terraform_base}/terraform-cli-config"
+-- MAGIC         if not os.path.exists(terraform_cli_config_path):
+-- MAGIC           terraform_cli_config = f'''provider_installation {{
+-- MAGIC   filesystem_mirror {{
+-- MAGIC     path    = "{provider_mirror_base}"
+-- MAGIC     include = ["registry.terraform.io/databricks/databricks"]
+-- MAGIC   }}
+-- MAGIC   direct {{
+-- MAGIC     exclude = ["registry.terraform.io/databricks/databricks"]
+-- MAGIC   }}
+-- MAGIC }}
+-- MAGIC disable_checkpoint = true
+-- MAGIC disable_checkpoint_signature = true
+-- MAGIC '''
+-- MAGIC
+-- MAGIC           with open(terraform_cli_config_path, 'w') as f:
+-- MAGIC             f.write(terraform_cli_config)
+-- MAGIC
+-- MAGIC         env["DATABRICKS_TF_VERSION"] = terraform_version
+-- MAGIC         env["DATABRICKS_TF_EXEC_PATH"] = terraform_exec_path
+-- MAGIC         env["DATABRICKS_TF_PROVIDER_VERSION"] = provider_version
+-- MAGIC         env["DATABRICKS_TF_CLI_CONFIG_FILE"] = terraform_cli_config_path
+-- MAGIC         env["TF_CLI_CONFIG_FILE"] = terraform_cli_config_path
+-- MAGIC
+-- MAGIC       cwd = os.path.normpath(f"/Workspace{cwd}")
+-- MAGIC
+-- MAGIC       if dev_cli_snippet:
+-- MAGIC         cli_path = cli_exec_path
+-- MAGIC         exec(dev_cli_snippet, globals(), locals())
+-- MAGIC
+-- MAGIC       env["DATABRICKS_BUNDLE_TMP"] = f"{tmp_base}/bundle-2-{hashlib.sha256(cwd.encode()).hexdigest()}"
+-- MAGIC       env["DATABRICKS_CLI_UPSTREAM"] = cli_upstream
+-- MAGIC
+-- MAGIC       if enable_yaml_sync == "true":
+-- MAGIC         env["DATABRICKS_BUNDLE_ENABLE_EXPERIMENTAL_YAML_SYNC"] = "1"
+-- MAGIC       else:
+-- MAGIC         env.pop("DATABRICKS_BUNDLE_ENABLE_EXPERIMENTAL_YAML_SYNC", None)
+-- MAGIC
+-- MAGIC       env["DATABRICKS_BUNDLE_ENGINE"] = "direct"
+-- MAGIC
+-- MAGIC       emit_event("setup_cli_environment", setup_cli_environment_start)
+-- MAGIC
+-- MAGIC       if allow_python_execution == "true":
+-- MAGIC         install_dependencies_start = time.monotonic()
+-- MAGIC         venv_path = _cli_runner_get_venv_path_from_databricks_yml(cwd)
+-- MAGIC         venv_folder_path = os.path.normpath(f"{cwd}/{venv_path}")
+-- MAGIC         venv_bin_path = f"{venv_folder_path}/bin"
+-- MAGIC
+-- MAGIC         os.makedirs(venv_bin_path, exist_ok=True)
+-- MAGIC
+-- MAGIC         python3_wrapper_path = f"{venv_bin_path}/python3"
+-- MAGIC         if not os.path.exists(python3_wrapper_path):
+-- MAGIC           with open(python3_wrapper_path, "w") as f:
+-- MAGIC             f.write('#!/usr/bin/env bash\nexec python3 "$@"\n')
+-- MAGIC           os.chmod(python3_wrapper_path, 0o755)
+-- MAGIC
+-- MAGIC         pyvenv_cfg_path = f"{venv_folder_path}/pyvenv.cfg"
+-- MAGIC         if not os.path.exists(pyvenv_cfg_path):
+-- MAGIC           with open(pyvenv_cfg_path, "w") as f:
+-- MAGIC             pass
+-- MAGIC
+-- MAGIC         pyproject_path = f"{cwd}/pyproject.toml"
+-- MAGIC         uv_pip_install_args = ["uv", "pip", "install", "--quiet", "--python", python3_wrapper_path, "--link-mode=copy"]
+-- MAGIC
+-- MAGIC         override_file = None
+-- MAGIC         if os.path.exists(pyproject_path):
+-- MAGIC           uv_pip_install_args.extend(["-r", pyproject_path, "--group", "dev"])
+-- MAGIC         else:
+-- MAGIC           uv_pip_install_args.append(f"databricks-bundles=={cli_version}")
+-- MAGIC
+-- MAGIC         try:
+-- MAGIC           subprocess.run(uv_pip_install_args, check=True, cwd=cwd, stdout=subprocess.DEVNULL, env=env)
+-- MAGIC         finally:
+-- MAGIC           if override_file and os.path.exists(override_file):
+-- MAGIC             os.remove(override_file)
+-- MAGIC         emit_event("install_dependencies", install_dependencies_start)
+-- MAGIC
+-- MAGIC         env.pop("DATABRICKS_BUNDLE_RESTRICTED_CODE_EXECUTION", None)
+-- MAGIC       else:
+-- MAGIC         env["DATABRICKS_BUNDLE_RESTRICTED_CODE_EXECUTION"] = "1"
+-- MAGIC
+-- MAGIC       env.pop("DATABRICKS_CLUSTER_ID", None)
+-- MAGIC
+-- MAGIC       with tempfile.NamedTemporaryFile(mode='w+', dir=tmpdirname, delete=True) as databrickscfg_file:
+-- MAGIC           profile_name = "workspace_profile"
+-- MAGIC           databrickscfg_file.write(f"[workspace_profile]\nhost = {workspace_url}")
+-- MAGIC           databrickscfg_file.flush()
+-- MAGIC           env["DATABRICKS_CONFIG_FILE"] = databrickscfg_file.name
+-- MAGIC
+-- MAGIC           cli_command = [cli_exec_path] + shlex.split(args) + ["-p", profile_name]
+-- MAGIC           tmp_file_path = tmp_file
+-- MAGIC
+-- MAGIC           run_cli_start = time.monotonic()
+-- MAGIC           run_cli_phase = "run_cli_genie" if cli_upstream == "genie-code" else "run_cli"
+-- MAGIC           try:
+-- MAGIC             _cli_runner_run_cli_command_with_token(
+-- MAGIC               cli_command,
+-- MAGIC               cwd,
+-- MAGIC               tmp_file_path,
+-- MAGIC               include_stderr_in_error == "true",
+-- MAGIC               token,
+-- MAGIC               env,
+-- MAGIC               cli_upstream=cli_upstream,
+-- MAGIC             )
+-- MAGIC           finally:
+-- MAGIC             emit_event(run_cli_phase, run_cli_start)
+-- MAGIC
+-- MAGIC
+-- MAGIC try:
+-- MAGIC   _databricks_cli_runner()
+-- MAGIC finally:
+-- MAGIC   del (
+-- MAGIC     _databricks_cli_runner,
+-- MAGIC     _cli_runner_get_venv_path_from_databricks_yml,
+-- MAGIC     _cli_runner_get_download_url,
+-- MAGIC     _cli_runner_run_cli_command,
+-- MAGIC     _cli_runner_run_cli_command_with_token,
+-- MAGIC   )
+-- MAGIC None
+-- MAGIC

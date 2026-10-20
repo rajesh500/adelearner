@@ -1,0 +1,51 @@
+[
+  {
+    "name": "Slack",
+    "isToggledOn": null,
+    "isLoading": false,
+    "disabledTools": [],
+    "mcpType": "internal"
+  },
+  {
+    "name": "Microsoft 365",
+    "isToggledOn": null,
+    "isLoading": false,
+    "disabledTools": [],
+    "mcpType": "internal"
+  },
+  {
+    "name": "Google Drive",
+    "isToggledOn": null,
+    "isLoading": false,
+    "disabledTools": [],
+    "mcpType": "internal"
+  },
+  {
+    "name": "Google Calendar",
+    "isToggledOn": null,
+    "isLoading": false,
+    "disabledTools": [],
+    "mcpType": "internal"
+  },
+  {
+    "name": "Gmail",
+    "isToggledOn": null,
+    "isLoading": false,
+    "disabledTools": [],
+    "mcpType": "internal"
+  },
+  {
+    "name": "GitHub",
+    "isToggledOn": null,
+    "isLoading": false,
+    "disabledTools": [],
+    "mcpType": "internal"
+  },
+  {
+    "name": "Atlassian",
+    "isToggledOn": null,
+    "isLoading": false,
+    "disabledTools": [],
+    "mcpType": "internal"
+  }
+]
